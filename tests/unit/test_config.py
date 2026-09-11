@@ -278,3 +278,74 @@ def test_old_format_rejected():
     finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
+
+
+# ---------------------------------------------------------------------------
+# Verbalized sampling config surface (spec §4.1, §6.3)
+# ---------------------------------------------------------------------------
+
+
+def test_generation_diversity_defaults_to_disabled(sample_config_dict):
+    """Without a diversity block, verbalized sampling is off."""
+    config = DeepFabricConfig(**sample_config_dict)
+
+    assert config.generation.diversity.verbalized.enabled is False
+    assert config.get_generation_params()["diversity"].verbalized.enabled is False
+
+
+def test_generation_diversity_is_loaded_from_yaml(sample_config_dict):
+    """The verbalized block parses and reaches the generator parameters."""
+    sample_config_dict["generation"]["diversity"] = {
+        "verbalized": {
+            "enabled": True,
+            "k": 8,
+            "select": 4,
+            "selection": "threshold",
+            "prob_threshold": 0.2,
+            "dedup": {"enabled": False},
+        }
+    }
+
+    config = DeepFabricConfig(**sample_config_dict)
+    verbalized = config.get_generation_params()["diversity"].verbalized
+
+    assert verbalized.enabled is True
+    assert verbalized.k == 8  # noqa: PLR2004
+    assert verbalized.select == 4  # noqa: PLR2004
+    assert verbalized.selection == "threshold"
+    assert verbalized.prob_threshold == 0.2  # noqa: PLR2004
+    assert verbalized.dedup.enabled is False
+    assert verbalized.sizing == "budget"
+
+
+def test_generation_diversity_rejects_select_greater_than_k(sample_config_dict):
+    sample_config_dict["generation"]["diversity"] = {"verbalized": {"k": 3, "select": 5}}
+
+    with pytest.raises(ValueError, match=r"select .* must be <= verbalized.k"):
+        DeepFabricConfig(**sample_config_dict)
+
+
+def test_generation_diversity_rejects_unsupported_expansion(sample_config_dict):
+    sample_config_dict["generation"]["diversity"] = {
+        "verbalized": {"enabled": True, "expansion": "two_pass"}
+    }
+
+    with pytest.raises(ValueError, match="not yet supported"):
+        DeepFabricConfig(**sample_config_dict)
+
+
+def test_generation_diversity_from_yaml_file(sample_config_dict):
+    """End-to-end: a YAML file carrying the block loads cleanly."""
+    sample_config_dict["generation"]["diversity"] = {
+        "verbalized": {"enabled": True, "k": 6, "select": 2, "sizing": "multiplier"}
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(sample_config_dict, f)
+        temp_path = f.name
+
+    try:
+        config = DeepFabricConfig.from_yaml(temp_path)
+        assert config.generation.diversity.verbalized.sizing == "multiplier"
+        assert config.generation.diversity.verbalized.k == 6  # noqa: PLR2004
+    finally:
+        os.unlink(temp_path)

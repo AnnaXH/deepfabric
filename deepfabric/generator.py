@@ -50,6 +50,7 @@ from .tools import BUILTIN_TOOL_REGISTRY
 from .tools.loader import load_tools_from_dict, load_tools_from_endpoint
 from .topic_model import Topic, TopicModel, TopicPath
 from .utils import ensure_not_running_loop, get_checkpoint_dir, is_validation_error
+from .verbalized import DiversityConfig
 
 # Handle circular import for type hints
 if TYPE_CHECKING:
@@ -167,6 +168,12 @@ class DataSetGeneratorConfig(BaseModel):
     def normalize_reasoning_style(cls, v: str | None) -> str | None:
         """Normalize deprecated reasoning_style values."""
         return _normalize_reasoning_style(v)
+
+    # Diversity configuration (verbalized sampling). Off by default.
+    diversity: DiversityConfig = Field(
+        default_factory=DiversityConfig,
+        description="Diversity configuration for generation (verbalized sampling)",
+    )
 
     # Tool configuration (used when tools are configured for agent mode)
     tool_components: dict[str, list[str]] = Field(
@@ -1007,6 +1014,55 @@ class DataSetGenerator:
                 error_summary=str(error)[:100],
             )
 
+    def _check_tool_executions(self, conversation: Conversation) -> ValueError | None:
+        """Validate a conversation's tool executions against the agent limits.
+
+        Truncates the executions in place when the limit is exceeded and
+        `max_tools_strict` is off.
+
+        Args:
+            conversation: Conversation to check.
+
+        Returns:
+            The validation error, or None when the conversation is acceptable.
+        """
+        if not conversation.tool_context or not conversation.tool_context.executions:
+            return ValueError("Agent mode requires at least one tool execution")
+
+        num_executions = len(conversation.tool_context.executions)
+        if num_executions > self.config.max_tools_per_query:
+            if self.config.max_tools_strict:
+                # Strict mode: discard entire sample
+                return ValueError(
+                    f"Sample has {num_executions} tool executions, "
+                    f"exceeds limit of {self.config.max_tools_per_query}"
+                )
+            # Non-strict mode: truncate to limit and keep sample
+            conversation.tool_context.executions = conversation.tool_context.executions[
+                : self.config.max_tools_per_query
+            ]
+        return None
+
+    def _apply_sizing(self, conversations: list[Conversation]) -> list[Conversation]:
+        """Apply the verbalized sizing mode to one node-slot's conversations.
+
+        Budget mode (the default) holds the dataset's target total: verbalized
+        sampling over-generates and selects, but only one sample per node-slot is
+        committed. Multiplier mode commits every selected candidate, so totals
+        grow with `select`.
+
+        Args:
+            conversations: Conversations produced for a single node-slot.
+
+        Returns:
+            The conversations to commit for that slot.
+        """
+        if len(conversations) <= 1:
+            return conversations
+        if self.config.diversity.verbalized.sizing == "multiplier":
+            return conversations
+        return conversations[:1]
+
     async def _generate_structured_samples_async(
         self,
         prompts: list[str],
@@ -1125,46 +1181,39 @@ class DataSetGenerator:
                     return False, last_error or Exception("Sample generation failed")
 
                 else:
+                    # Verbalized sampling fans one node out into several
+                    # conversations; every other builder returns exactly one.
+                    conversations = (
+                        list(conversation) if isinstance(conversation, list) else [conversation]
+                    )
+
                     # Validate tool execution count for agent mode (when tools configured)
                     if self.tool_registry is not None:
-                        if (
-                            not conversation.tool_context
-                            or not conversation.tool_context.executions
-                        ):
-                            last_error = ValueError(
-                                "Agent mode requires at least one tool execution"
-                            )
+                        tool_error = next(
+                            (
+                                error
+                                for error in (self._check_tool_executions(c) for c in conversations)
+                                if error is not None
+                            ),
+                            None,
+                        )
+                        if tool_error is not None:
+                            last_error = tool_error
                             if attempt < self.config.sample_retries:
                                 self._emit_retry(sample_idx, attempt, max_attempts, last_error)
                                 continue
                             return False, last_error or Exception("Sample generation failed")
 
-                        num_executions = len(conversation.tool_context.executions)
-                        if num_executions > self.config.max_tools_per_query:
-                            if self.config.max_tools_strict:
-                                # Strict mode: discard entire sample
-                                last_error = ValueError(
-                                    f"Sample has {num_executions} tool executions, "
-                                    f"exceeds limit of {self.config.max_tools_per_query}"
-                                )
-                                if attempt < self.config.sample_retries:
-                                    self._emit_retry(sample_idx, attempt, max_attempts, last_error)
-                                    continue
-                                return False, last_error or Exception("Sample generation failed")
-                            # Non-strict mode: truncate to limit and keep sample
-                            conversation.tool_context.executions = (
-                                conversation.tool_context.executions[
-                                    : self.config.max_tools_per_query
-                                ]
-                            )
-
                     # Add topic_id to conversation metadata for traceability
-                    if topic_path_info and hasattr(conversation, "metadata"):
-                        if conversation.metadata is None:
-                            conversation.metadata = {}
-                        conversation.metadata["topic_id"] = topic_path_info.topic_id
+                    if topic_path_info:
+                        for conv in conversations:
+                            if not hasattr(conv, "metadata"):
+                                continue
+                            if conv.metadata is None:
+                                conv.metadata = {}
+                            conv.metadata["topic_id"] = topic_path_info.topic_id
 
-                    return True, conversation
+                    return True, conversations
 
             return False, last_error or Exception("Sample generation failed")
 
@@ -1183,7 +1232,9 @@ class DataSetGenerator:
 
         for idx, (success, payload) in enumerate(results):
             if success:
-                samples.append(payload)
+                # payload is this node-slot's conversations; the sizing mode
+                # decides how many of them are committed to the dataset.
+                samples.extend(self._apply_sizing(payload))
             else:
                 error = payload
                 error_msg = f"Generation failed: {error}"
@@ -2111,9 +2162,11 @@ class DataSetGenerator:
                     prompts, include_sys_msg, start_sample_idx, topic_paths_for_batch
                 )
 
-                # Verify all prompts are accounted for (no silent drops)
+                # Verify all prompts are accounted for (no silent drops).
+                # Under verbalized sampling in multiplier mode a prompt can
+                # yield several samples, so only a shortfall is a problem.
                 accounted = len(samples) + len(failed_responses)
-                if accounted != len(prompts):
+                if accounted < len(prompts):
                     logger.warning(
                         "Sample accounting mismatch: %d prompts, %d samples, %d failures (missing %d)",
                         len(prompts),

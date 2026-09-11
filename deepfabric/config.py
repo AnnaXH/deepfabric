@@ -22,6 +22,7 @@ from .constants import (
 from .exceptions import ConfigurationError
 from .metrics import trace
 from .utils import parse_num_samples
+from .verbalized import DiversityConfig
 
 
 def _normalize_reasoning_style(value: str | None) -> str | None:
@@ -262,6 +263,13 @@ class GenerationConfig(BaseModel):
         description="Rate limiting and retry configuration",
     )
     save_as: str | None = Field(default=None, description="Where to save the generated samples")
+
+    # Diversity controls (verbalized sampling, spec §4/§6). Disabled by default:
+    # with diversity.verbalized.enabled false, generation behaves exactly as before.
+    diversity: DiversityConfig = Field(
+        default_factory=DiversityConfig,
+        description="Diversity configuration for sample generation (verbalized sampling)",
+    )
 
     # Custom structured output schema (bypasses conversation format)
     output_schema: dict | None = Field(
@@ -646,6 +654,8 @@ See documentation for full examples.
             # Conversation config
             "conversation_type": self.generation.conversation.type,
             "reasoning_style": self.generation.conversation.reasoning_style,
+            # Diversity config (verbalized sampling)
+            "diversity": self.generation.diversity,
             # Output config
             "sys_msg": self.output.include_system_message,
             "dataset_system_prompt": self.output.system_prompt or self.generation.system_prompt,
