@@ -21,6 +21,11 @@ if TYPE_CHECKING:
     from .topic_model import TopicModel
 
 
+def _as_int(value: object) -> int:
+    """Coerce a progress-event value to an int, defaulting to 0."""
+    return int(value) if isinstance(value, str | int) else 0
+
+
 def _ensure_not_running_loop(func_name: str) -> None:
     """Raise a helpful error if invoked from an active asyncio loop."""
     try:
@@ -77,7 +82,13 @@ async def _process_graph_events(graph: Graph, debug: bool = False) -> dict | Non
                     if isinstance(event.get("connections_added", 0), str | int)
                     else 0
                 )
-                tui.complete_node_expansion(event["node_topic"], subtopics_added, connections_added)
+                tui.complete_node_expansion(
+                    event["node_topic"],
+                    subtopics_added,
+                    connections_added,
+                    _as_int(event.get("duplicates_collapsed", 0)),
+                    _as_int(event.get("connections_added_via_merge", 0)),
+                )
             elif event["event"] == "depth_complete":
                 depth = int(event["depth"]) if isinstance(event["depth"], str | int) else 0
                 tui.complete_depth_level(depth)
@@ -157,7 +168,11 @@ async def _process_tree_events(tree: Tree, debug: bool = False) -> dict | None:
                     if isinstance(event["failed_generations"], str | int)
                     else 0
                 )
-                tui.finish_building(total_paths, failed_generations)
+                tui.finish_building(
+                    total_paths,
+                    failed_generations,
+                    _as_int(event.get("duplicates_collapsed", 0)),
+                )
                 final_event = event
 
                 if failed_generations > 0 and hasattr(tree, "failed_generations"):

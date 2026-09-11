@@ -612,7 +612,9 @@ class TreeBuildingTUI(TopicGenerationTUI):
         self._refresh_left()
         self.update_status_panel()
 
-    def finish_building(self, total_paths: int, failed_generations: int) -> None:
+    def finish_building(
+        self, total_paths: int, failed_generations: int, duplicates_collapsed: int = 0
+    ) -> None:
         """Finish the tree building process."""
         if self.live_display:
             self.live_display.stop()
@@ -624,6 +626,8 @@ class TreeBuildingTUI(TopicGenerationTUI):
             self.tui.warning(f"Created {total_paths} unique topics ({failed_generations} failed)")
         else:
             self.tui.success(f"Created {total_paths} unique topics")
+        if duplicates_collapsed:
+            self.tui.info(f"Dropped {duplicates_collapsed} duplicate topics")
         self.events_log.append("✓ Tree building completed")
         self.update_status_panel()
 
@@ -646,6 +650,8 @@ class GraphBuildingTUI(TopicGenerationTUI):
         super().__init__(tui)
         self.nodes_count = 1  # Start with root
         self.edges_count = 0
+        self.duplicates_collapsed = 0
+        self.connections_added_via_merge = 0
 
     def _get_title(self) -> str:
         return "DeepFabric Graph Generation"
@@ -681,12 +687,19 @@ class GraphBuildingTUI(TopicGenerationTUI):
         self.update_status_panel()
 
     def complete_node_expansion(
-        self, node_topic: str, subtopics_added: int, connections_added: int
+        self,
+        node_topic: str,
+        subtopics_added: int,
+        connections_added: int,
+        duplicates_collapsed: int = 0,
+        connections_added_via_merge: int = 0,
     ) -> None:
         """Track node expansion."""
         _ = node_topic  # Mark as intentionally unused
         self.nodes_count += subtopics_added
-        self.edges_count += subtopics_added + connections_added
+        self.edges_count += subtopics_added + connections_added + connections_added_via_merge
+        self.duplicates_collapsed += duplicates_collapsed
+        self.connections_added_via_merge += connections_added_via_merge
 
     def complete_depth_level(self, depth: int) -> None:
         """Complete a depth level."""
@@ -777,15 +790,22 @@ class GraphBuildingTUI(TopicGenerationTUI):
                 )
             else:
                 self.tui.success(f"Created {self.nodes_count} unique topics")
+            if self.duplicates_collapsed:
+                self.tui.info(
+                    f"Collapsed {self.duplicates_collapsed} duplicate topics "
+                    f"({self.connections_added_via_merge} merged as connections)"
+                )
         else:
             # Rich mode: show detailed stats panel
-            stats_table = self.tui.create_stats_table(
-                {
-                    "Total Nodes": self.nodes_count,
-                    "Total Edges": self.edges_count,
-                    "Failed Attempts": self.failed_attempts,
-                }
-            )
+            stats = {
+                "Total Nodes": self.nodes_count,
+                "Total Edges": self.edges_count,
+                "Failed Attempts": self.failed_attempts,
+            }
+            if self.duplicates_collapsed:
+                stats["Duplicates Collapsed"] = self.duplicates_collapsed
+                stats["Merged Connections"] = self.connections_added_via_merge
+            stats_table = self.tui.create_stats_table(stats)
             self.console.print(Panel(stats_table, title="Final Statistics", border_style="dim"))
             if failed_generations > 0:
                 self.tui.warning(f"Graph building complete with {failed_generations} failures")
