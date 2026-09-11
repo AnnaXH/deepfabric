@@ -95,6 +95,7 @@ Controls topic tree/graph generation.
 | `system_prompt` | string | "" | Custom instructions for topic LLM |
 | `max_tokens` | int | 1000 | Max tokens for topic generation LLM calls |
 | `save_as` | string | - | Path to save topics JSONL |
+| `dedup` | object | - | Duplicate topic detection (see below) |
 | `llm` | object | - | Override shared LLM settings |
 
 #### topics.prompt_style (Graph Mode Only)
@@ -119,6 +120,84 @@ topics:
   system_prompt: |
     Generate adversarial security test cases for AI assistant hardening.
 ```
+
+#### topics.dedup
+
+Each node is expanded independently, so models routinely re-derive the same
+subtopic in different branches ("Best practices", "Common pitfalls"). Without
+deduplication every one of those survives as its own node, wasting generation
+budget and making topical coverage look broader than it is.
+
+Detection is **exact**: two topics are duplicates when their normalised forms
+hash identically. Near-duplicates ("REST API authentication" vs "Authenticating
+REST APIs") are not detected.
+
+```yaml
+topics:
+  mode: graph
+  dedup:
+    exact: true                   # on by default; false = legacy (no dedup)
+    normalise:                    # applied before hashing; safest -> most aggressive
+      casefold: true              # "REST API" == "rest api"
+      whitespace: true            # trim and collapse internal runs
+      strip_punctuation: true     # "REST-API auth." == "rest api auth"
+      strip_stopwords: false      # "auth for APIs" == "auth of APIs" (see warning)
+    on_duplicate: null            # merge_as_connection | drop | keep; null = per-mode default
+    backfill:
+      enabled: false
+      max_attempts: 2
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `exact` | bool | true | Collapse exact (post-normalisation) duplicates |
+| `normalise.casefold` | bool | true | Lowercase before hashing |
+| `normalise.whitespace` | bool | true | Trim and collapse whitespace runs |
+| `normalise.strip_punctuation` | bool | true | Drop punctuation (symbols like `C++` are kept) |
+| `normalise.strip_stopwords` | bool | false | Drop filler words - aggressive, see warning |
+| `on_duplicate` | string | per-mode | `merge_as_connection` (graph), `drop`, or `keep` |
+| `backfill.enabled` | bool | false | Re-request subtopics lost to deduplication |
+| `backfill.max_attempts` | int | 2 | Cap on extra generation rounds per node (0-10) |
+
+**`on_duplicate`** defaults differ by mode, because a repeated subtopic means
+different things:
+
+- **Graph mode -> `merge_as_connection`**: no new node is created; an edge is
+  added from the current parent to the existing node. The accidental duplicate
+  becomes an intentional shared node, so the parent -> subtopic relationship is
+  kept rather than discarded. Merges that would close a cycle fall back to
+  dropping. This is not gated by `prompt_style` - set `on_duplicate: drop`
+  explicitly if you want connection-free output under `isolated`/`anchored`.
+- **Tree mode -> `drop`**: the duplicate is skipped. Trees cannot express a
+  shared node, so `merge_as_connection` is rejected for `mode: tree`.
+- **Either mode -> `keep`**: detect and count only, output unchanged. Useful for
+  measuring your duplication rate before acting on it.
+
+Deduplication scope is the whole topic model in both modes: a subtopic is a
+duplicate if it matches *any* existing topic, not just its siblings.
+
+!!! warning "strip_stopwords is aggressive"
+    Stopword lists are language-specific and arbitrary, and stripping them can
+    merge genuinely distinct topics ("security **of** APIs" vs "security **for**
+    APIs"). Enable it only for a narrow domain where filler-word duplicates are a
+    known problem.
+
+!!! note "Fewer nodes is the intended outcome"
+    Deduplication is on by default, so a graph or tree built from a given config
+    will contain fewer nodes than it did before - the removed nodes were
+    duplicates. Dataset sizes derived from node counts shrink accordingly. Set
+    `dedup: {exact: false}` for byte-identical legacy output.
+
+#### topics.dedup.backfill
+
+Collapsing duplicates leaves a node with fewer children than `degree`. By
+default that reduced branching is accepted and reported (`duplicates_collapsed`
+and `effective_degree` are shown in the build summary and progress events).
+
+With `backfill.enabled: true` only the shortfall is re-requested, deduplicated
+again, and capped by `max_attempts` so expansion always terminates. Its value is
+limited without a more diverse candidate generator: re-asking the same model
+tends to re-roll the same collapsed subtopics.
 
 #### Failed Generation Tracking
 
