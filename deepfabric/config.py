@@ -19,6 +19,7 @@ from .constants import (
     TOPIC_TREE_DEFAULT_DEPTH,
     TOPIC_TREE_DEFAULT_TEMPERATURE,
 )
+from .dedup import DedupConfig
 from .exceptions import ConfigurationError
 from .metrics import trace
 from .utils import parse_num_samples
@@ -120,11 +121,25 @@ class TopicsConfig(BaseModel):
         default="default",
         description="For graph mode: 'default' enables cross-connections with generic prompts, 'isolated' disables connections with generic prompts, 'anchored' disables connections and uses domain-aware prompts with examples for focused topic generation",
     )
+    dedup: DedupConfig = Field(
+        default_factory=DedupConfig,
+        description="Exact (hash-based) duplicate topic detection and handling",
+    )
 
     # Optional LLM overrides (inherits from top-level llm if not specified)
     llm: LLMConfig | None = Field(
         default=None, description="Optional LLM configuration overrides for topics"
     )
+
+    @model_validator(mode="after")
+    def resolve_dedup_defaults(self):
+        """Resolve dedup.on_duplicate to the per-mode default at load time.
+
+        Keeping the effective value explicit means logs and events never show a
+        bare 'null' for behaviour that differs between tree and graph mode.
+        """
+        self.dedup = self.dedup.resolve_for_mode(self.mode)
+        return self
 
 
 class ConversationConfig(BaseModel):
@@ -614,6 +629,7 @@ See documentation for full examples.
             "max_concurrent": self.topics.max_concurrent,
             "max_tokens": self.topics.max_tokens,
             "prompt_style": self.topics.prompt_style,
+            "dedup": self.topics.dedup,
         }
 
         # Handle overrides
