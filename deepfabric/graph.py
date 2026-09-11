@@ -5,7 +5,7 @@ import textwrap
 import uuid
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,6 +16,7 @@ from .constants import (
     TOPIC_GRAPH_DEFAULT_TEMPERATURE,
     TOPIC_GRAPH_SUMMARY,
 )
+from .dedup import DedupConfig
 from .llm import LLMClient
 from .llm.rate_limit_detector import RateLimitDetector
 from .metrics import trace
@@ -83,6 +84,19 @@ class GraphConfig(BaseModel):
         default="default",
         description="Prompt style: 'default' (cross-connections, generic), 'isolated' (no connections, generic), 'anchored' (no connections, domain-aware)",
     )
+    dedup: DedupConfig = Field(
+        default_factory=DedupConfig,
+        description="Exact duplicate-node detection and handling",
+    )
+
+
+class ExpansionResult(NamedTuple):
+    """Outcome of expanding a single node into subtopics."""
+
+    subtopics_added: int
+    connections_added: int
+    duplicates_collapsed: int = 0
+    connections_added_via_merge: int = 0
 
 
 class GraphMetadata(BaseModel):
@@ -128,7 +142,10 @@ class Node:
         if "uuid" not in self.metadata:
             self.metadata["uuid"] = str(uuid.uuid4())
 
-        # Auto-generate topic_hash if not present (duplicate detection via SHA256)
+        # Content hash of the raw topic, kept as stable provenance in saved
+        # graphs. Duplicate detection uses the *normalised* hash held in the
+        # graph's in-memory index instead (see deepfabric/dedup.py), which
+        # depends on configurable normalisation and so is not persisted here.
         if "topic_hash" not in self.metadata:
             self.metadata["topic_hash"] = hashlib.sha256(topic.encode("utf-8")).hexdigest()
 
@@ -145,6 +162,8 @@ class Node:
 
 class Graph(TopicModel):
     """Represents the topic graph and manages its structure."""
+
+    dedup_mode = "graph"
 
     def __init__(self, **kwargs):
         try:
@@ -163,6 +182,9 @@ class Graph(TopicModel):
         self.max_concurrent = self.config.max_concurrent
         self.max_tokens = self.config.max_tokens
         self.prompt_style = self.config.prompt_style
+
+        # Exact-duplicate detection: hash index, counters and resolved on_duplicate
+        self._init_dedup(self.config.dedup)
 
         # Initialize LLM client
         llm_kwargs = {}
@@ -195,16 +217,18 @@ class Graph(TopicModel):
         self.nodes: dict[int, Node] = {0: self.root}
         self._next_node_id: int = 1
         self.failed_generations: list[dict[str, Any]] = []
+        self.dedup_register(self.root.topic, self.root.id)
 
     def _wrap_text(self, text: str, width: int = 30) -> str:
         """Wrap text to a specified width."""
         return "\n".join(textwrap.wrap(text, width=width))
 
     def add_node(self, topic: str, metadata: dict[str, Any] | None = None) -> Node:
-        """Adds a new node to the graph."""
+        """Adds a new node to the graph and registers it for duplicate detection."""
         node = Node(topic, self._next_node_id, metadata)
         self.nodes[node.id] = node
         self._next_node_id += 1
+        self.dedup_register(node.topic, node.id)
         return node
 
     def add_edge(self, parent_id: int, child_id: int) -> None:
@@ -257,6 +281,7 @@ class Graph(TopicModel):
                 child.parents.remove(node)
 
         del self.nodes[node_id]
+        self.dedup_unregister(node.topic, node_id)
 
     def remove_subtree(self, node_id: int) -> list[int]:
         """Remove a node and all its descendants from the graph.
@@ -347,6 +372,7 @@ class Graph(TopicModel):
                 if node in child.parents:
                     child.parents.remove(node)
             del self.nodes[nid]
+            self.dedup_unregister(node.topic, nid)
 
         return list(to_remove_set)
 
@@ -412,6 +438,13 @@ class Graph(TopicModel):
                 graph.add_edge(node_model.id, child_id)
 
         graph._next_node_id = max(graph.nodes.keys()) + 1
+
+        # Rebuild the dedup index so further expansion sees the loaded nodes.
+        # Hashes are recomputed from the current normalisation settings rather
+        # than trusted from the file.
+        graph.dedup_rebuild_index(
+            (node.topic, node.id) for node in sorted(graph.nodes.values(), key=lambda n: n.id)
+        )
         return graph
 
     @classmethod
@@ -490,21 +523,21 @@ class Graph(TopicModel):
 
                     async def bounded_expand(
                         node: Node, sem: asyncio.Semaphore = semaphore
-                    ) -> tuple[int, int]:
+                    ) -> ExpansionResult:
                         async with sem:
                             return await self.get_subtopics_and_connections(node, self.degree)
 
                     tasks = [bounded_expand(node) for node in leaf_nodes]
                     results = await asyncio.gather(*tasks)
 
-                    for node, (subtopics_added, connections_added) in zip(
-                        leaf_nodes, results, strict=True
-                    ):
+                    for node, result in zip(leaf_nodes, results, strict=True):
                         yield {
                             "event": "node_expanded",
                             "node_topic": node.topic,
-                            "subtopics_added": subtopics_added,
-                            "connections_added": connections_added,
+                            "subtopics_added": result.subtopics_added,
+                            "connections_added": result.connections_added,
+                            "duplicates_collapsed": result.duplicates_collapsed,
+                            "connections_added_via_merge": result.connections_added_via_merge,
                         }
 
                 yield {"event": "depth_complete", "depth": depth + 1}
@@ -520,6 +553,9 @@ class Graph(TopicModel):
                     "nodes_count": len(self.nodes),
                     "failed_generations": len(self.failed_generations),
                     "success": len(self.nodes) > 1,
+                    "duplicates_collapsed": self.dedup_stats.duplicates_collapsed,
+                    "connections_added_via_merge": self.dedup_stats.connections_added_via_merge,
+                    "effective_degree": self.dedup_stats.effective_degree,
                 },
             )
 
@@ -527,28 +563,107 @@ class Graph(TopicModel):
                 "event": "build_complete",
                 "nodes_count": len(self.nodes),
                 "failed_generations": len(self.failed_generations),
+                **self.dedup_stats.as_event(),
             }
 
         except Exception as e:
             yield {"event": "error", "error": str(e)}
             raise
 
+    def _would_create_cycle(self, parent_id: int, child_id: int) -> bool:
+        """Check whether adding parent -> child would close a cycle.
+
+        True when the child already reaches the parent, i.e. the child is an
+        ancestor of the parent (or is the parent itself).
+
+        Args:
+            parent_id: The proposed edge's source node.
+            child_id: The proposed edge's target node.
+
+        Returns:
+            True if the edge must not be added.
+        """
+        if parent_id == child_id:
+            return True
+
+        # Walk up the parent's ancestors; the edge closes a cycle if the
+        # candidate child is among them.
+        seen: set[int] = set()
+        queue = [parent_id]
+        while queue:
+            current_id = queue.pop()
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            current = self.nodes.get(current_id)
+            if current is None:
+                continue
+            for ancestor in current.parents:
+                if ancestor.id == child_id:
+                    return True
+                queue.append(ancestor.id)
+        return False
+
+    def _handle_duplicate(self, parent_node: Node, existing_id: int) -> ExpansionResult:
+        """Apply the configured on_duplicate action to a detected duplicate.
+
+        Args:
+            parent_node: The node currently being expanded.
+            existing_id: Id of the node that already carries this topic.
+
+        Returns:
+            The counter deltas for this duplicate.
+        """
+        existing_node = self.nodes.get(existing_id)
+        if (
+            self.dedup_action == "merge_as_connection"
+            and existing_node is not None
+            and not self._would_create_cycle(parent_node.id, existing_id)
+        ):
+            # The accidental duplicate becomes an intentional shared node: the
+            # parent -> subtopic relationship is kept as an edge instead of
+            # being discarded.
+            is_new_edge = existing_node not in parent_node.children
+            self.add_edge(parent_node.id, existing_id)
+            return ExpansionResult(
+                0, 0, duplicates_collapsed=1, connections_added_via_merge=int(is_new_edge)
+            )
+
+        # drop, or a merge that would have closed a cycle
+        return ExpansionResult(0, 0, duplicates_collapsed=1)
+
     def _process_subtopics_response(
         self, response: GraphSubtopics, parent_node: Node
-    ) -> tuple[int, int]:
+    ) -> ExpansionResult:
         """Process a GraphSubtopics response, adding nodes and edges to the graph.
+
+        Exact duplicates are resolved against the graph-wide hash index before a
+        node is created. Under the default ``merge_as_connection`` action a
+        duplicate becomes an edge to the existing node rather than a new node.
 
         Args:
             response: The structured response containing subtopics and connections.
             parent_node: The parent node to connect new subtopics to.
 
         Returns:
-            A tuple of (subtopics_added, connections_added).
+            An ExpansionResult with the counters for this expansion.
         """
         subtopics_added = 0
         connections_added = 0
+        duplicates_collapsed = 0
+        merged_connections = 0
 
         for subtopic_data in response.subtopics:
+            existing_id = self.dedup_lookup(subtopic_data.topic)
+            if existing_id is not None:
+                self.dedup_stats.duplicates_detected += 1
+                if self.dedup_action != "keep":
+                    outcome = self._handle_duplicate(parent_node, existing_id)
+                    duplicates_collapsed += outcome.duplicates_collapsed
+                    merged_connections += outcome.connections_added_via_merge
+                    continue
+                # keep: detection only - the duplicate node is still inserted
+
             new_node = self.add_node(subtopic_data.topic)
             self.add_edge(parent_node.id, new_node.id)
             subtopics_added += 1
@@ -557,7 +672,13 @@ class Graph(TopicModel):
                     self.add_edge(connection_id, new_node.id)
                     connections_added += 1
 
-        return subtopics_added, connections_added
+        self.dedup_stats.duplicates_collapsed += duplicates_collapsed
+        self.dedup_stats.connections_added_via_merge += merged_connections
+        self.dedup_stats.subtopics_added += subtopics_added
+
+        return ExpansionResult(
+            subtopics_added, connections_added, duplicates_collapsed, merged_connections
+        )
 
     def _get_friendly_error_message(self, exception: Exception) -> str:
         """Convert an exception into a user-friendly error message for TUI display.
@@ -692,17 +813,15 @@ class Graph(TopicModel):
             current = current.parents[0] if current.parents else None
         return list(reversed(path))
 
-    async def get_subtopics_and_connections(
-        self, parent_node: Node, num_subtopics: int
-    ) -> tuple[int, int]:
-        """Generate subtopics and connections for a given node.
+    def _build_expansion_prompt(self, parent_node: Node, num_subtopics: int) -> str:
+        """Build the expansion prompt for a node according to prompt_style.
 
         Args:
-            parent_node: The node to generate subtopics for.
-            num_subtopics: The number of subtopics to generate.
+            parent_node: The node being expanded.
+            num_subtopics: How many subtopics to request.
 
         Returns:
-            A tuple of (subtopics_added, connections_added).
+            The prompt string to send to the LLM.
         """
         # Choose prompt based on prompt_style setting
         if self.prompt_style == "anchored":
@@ -734,13 +853,75 @@ class Graph(TopicModel):
             graph_prompt = graph_prompt.replace("{{current_topic}}", parent_node.topic)
             graph_prompt = graph_prompt.replace("{{num_subtopics}}", str(num_subtopics))
 
-        response = await self._generate_subtopics_with_retry(graph_prompt, parent_node)
-        if response is None:
-            return 0, 0
+        return graph_prompt
 
-        return self._process_subtopics_response(
-            response, parent_node
-        )  # No subtopics or connections added on failure
+    async def get_subtopics_and_connections(
+        self, parent_node: Node, num_subtopics: int
+    ) -> ExpansionResult:
+        """Generate subtopics and connections for a given node.
+
+        Duplicates are collapsed as the response is processed, which can leave
+        the node with fewer than ``num_subtopics`` children. That shortfall is
+        accepted (and reported) unless backfill is enabled.
+
+        Args:
+            parent_node: The node to generate subtopics for.
+            num_subtopics: The number of subtopics to generate.
+
+        Returns:
+            An ExpansionResult with the counters for this expansion.
+        """
+        self.dedup_stats.expansions += 1
+        prompt = self._build_expansion_prompt(parent_node, num_subtopics)
+
+        response = await self._generate_subtopics_with_retry(prompt, parent_node)
+        if response is None:
+            # No subtopics or connections added on failure
+            return ExpansionResult(0, 0)
+
+        result = self._process_subtopics_response(response, parent_node)
+        return await self._backfill_expansion(parent_node, num_subtopics, result)
+
+    async def _backfill_expansion(
+        self, parent_node: Node, num_subtopics: int, result: ExpansionResult
+    ) -> ExpansionResult:
+        """Re-request the subtopics lost to deduplication, if backfill is enabled.
+
+        Bounded by ``dedup.backfill.max_attempts`` so expansion always
+        terminates, even if the model keeps returning the same duplicates.
+
+        Args:
+            parent_node: The node being expanded.
+            num_subtopics: The originally requested branching factor.
+            result: Counters from the first generation round.
+
+        Returns:
+            The accumulated ExpansionResult across all rounds.
+        """
+        backfill = self.dedup.backfill
+        if not (self.dedup.exact and backfill.enabled):
+            return result
+
+        for _ in range(backfill.max_attempts):
+            shortfall = num_subtopics - result.subtopics_added
+            if shortfall <= 0:
+                break
+
+            self.dedup_stats.backfill_requests += 1
+            prompt = self._build_expansion_prompt(parent_node, shortfall)
+            response = await self._generate_subtopics_with_retry(prompt, parent_node)
+            if response is None:
+                break
+
+            extra = self._process_subtopics_response(response, parent_node)
+            result = ExpansionResult(
+                result.subtopics_added + extra.subtopics_added,
+                result.connections_added + extra.connections_added,
+                result.duplicates_collapsed + extra.duplicates_collapsed,
+                result.connections_added_via_merge + extra.connections_added_via_merge,
+            )
+
+        return result
 
     def get_all_paths(self) -> list[list[str]]:
         """Returns all paths from the root to leaf nodes."""
@@ -792,16 +973,22 @@ class Graph(TopicModel):
         visited.remove(node.id)
 
     def get_unique_topics(self) -> list[Topic]:
-        """Returns deduplicated topics by UUID.
+        """Returns one Topic per node, so each node is generated for once.
 
-        Iterates through all nodes in the graph and returns unique topics.
-        Each node has a UUID in its metadata, ensuring uniqueness.
+        UUIDs are generated per node and are therefore always distinct: the
+        UUID pass only prevents the same node being enumerated twice (which
+        matters for graphs, where many paths reach one node). It collapses no
+        duplicate topics — that happens at insertion time via the hash index.
+
+        As a backstop for graphs built or loaded with duplicates already in
+        them, topics sharing a normalised hash are also collapsed here when
+        exact dedup is enabled.
 
         Returns:
             List of Topic namedtuples containing (uuid, topic).
-            Each UUID appears exactly once.
         """
         seen_uuids: set[str] = set()
+        seen_hashes: set[str] = set()
         result: list[Topic] = []
 
         for node in self.nodes.values():
@@ -809,9 +996,15 @@ class Graph(TopicModel):
             if node.id == self.root.id:
                 continue
             node_uuid = node.metadata.get("uuid")
-            if node_uuid and node_uuid not in seen_uuids:
-                seen_uuids.add(node_uuid)
-                result.append(Topic(uuid=node_uuid, topic=node.topic))
+            if not node_uuid or node_uuid in seen_uuids:
+                continue
+            if self.dedup.exact:
+                topic_hash = self.dedup_hash(node.topic)
+                if topic_hash in seen_hashes:
+                    continue
+                seen_hashes.add(topic_hash)
+            seen_uuids.add(node_uuid)
+            result.append(Topic(uuid=node_uuid, topic=node.topic))
 
         return result
 

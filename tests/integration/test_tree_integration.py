@@ -21,6 +21,7 @@ class TestTreeIntegration:
             degree: int,
             depth: int,
             system_prompt: str = "",
+            dedup: dict | None = None,
         ) -> Tree:
             """Helper to build a Tree with common test parameters."""
             return Tree(
@@ -31,6 +32,7 @@ class TestTreeIntegration:
                 provider=openai_config["provider"],
                 model_name=openai_config["model_name"],
                 temperature=openai_config["temperature"],
+                dedup=dedup or {},
             )
 
         return _builder
@@ -52,12 +54,17 @@ class TestTreeIntegration:
         # Verify build completion event
         completes = [e for e in events if e.get("event") == "build_complete"]
         assert len(completes) == 1
-        assert completes[0]["total_paths"] == degree**depth
+        # Dedup is on by default, so a real model repeating a subtopic string
+        # legitimately yields fewer paths. degree**depth is the ceiling, not the
+        # count — test_tree_dedup_disabled_preserves_full_shape pins equality.
+        assert 1 <= completes[0]["total_paths"] <= degree**depth
+        assert "duplicates_collapsed" in completes[0]
+        assert "effective_degree" in completes[0]
 
         # Verify paths were built as expected
         paths = tree.get_all_paths()
-        assert_topic_build_result(paths, tree, min_paths=degree**depth, context="tree basic build")
-        assert all(len(p) == depth + 1 for p in paths)
+        assert_topic_build_result(paths, tree, min_paths=1, context="tree basic build")
+        assert all(len(p) <= depth + 1 for p in paths)
         assert all(p[0] == topic for p in paths)
 
     @pytest.mark.openai
@@ -74,12 +81,15 @@ class TestTreeIntegration:
 
         assert last_event is not None
         assert last_event.get("event") == "build_complete"
+        # A single branch produces exactly one path whether or not dedup fires;
+        # what dedup can change is where that path terminates, so only the
+        # path length is relaxed here.
         assert last_event["total_paths"] == degree**depth
         paths = tree.get_all_paths()
         assert_topic_build_result(
             paths, tree, min_paths=degree**depth, context="tree deeper recursion"
         )
-        assert all(len(p) == depth + 1 for p in paths)
+        assert all(len(p) <= depth + 1 for p in paths)
 
     @pytest.mark.openai
     @pytest.mark.flaky(reruns=1, reruns_delay=3)
@@ -98,13 +108,13 @@ class TestTreeIntegration:
 
         # Read and validate structure from file
         lines = out_path.read_text().splitlines()
-        assert len(lines) == degree**depth
+        assert 1 <= len(lines) <= degree**depth
 
         items = [json.loads(line) for line in lines]
         assert all(isinstance(obj, dict) for obj in items)
         assert all("path" in obj for obj in items)
         assert all(isinstance(obj["path"], list) for obj in items)
-        assert all(len(obj["path"]) == depth + 1 for obj in items)
+        assert all(len(obj["path"]) <= depth + 1 for obj in items)
         assert all(obj["path"][0] == root_topic for obj in items)
         assert all(list(obj.keys()) == ["path"] for obj in items)
 
@@ -131,8 +141,8 @@ class TestTreeIntegration:
         # Assert round-trip equality
         assert rebuilt.get_all_paths() == tree.get_all_paths()
         # And both reflect expected shape
-        assert len(rebuilt.get_all_paths()) == degree**depth
-        assert all(len(p) == depth + 1 for p in rebuilt.get_all_paths())
+        assert 1 <= len(rebuilt.get_all_paths()) <= degree**depth
+        assert all(len(p) <= depth + 1 for p in rebuilt.get_all_paths())
         assert all(p[0] == root for p in rebuilt.get_all_paths())
 
     @pytest.mark.openai
@@ -163,8 +173,10 @@ class TestTreeIntegration:
             def stop_live(self) -> None:
                 pass
 
-            def finish_building(self, total_paths: int, failed_generations: int) -> None:
-                self.finished.append((total_paths, failed_generations))
+            def finish_building(
+                self, total_paths: int, failed_generations: int, duplicates_collapsed: int = 0
+            ) -> None:
+                self.finished.append((total_paths, failed_generations, duplicates_collapsed))
 
             # StreamObserver callback used by ProgressReporter
             def on_stream_chunk(self, source: str, chunk: str, metadata: dict) -> None:  # noqa: D401, ARG002
@@ -191,3 +203,31 @@ class TestTreeIntegration:
         # Streaming should have produced at least one chunk
         assert isinstance(fake_tui.chunks, list)
         assert len(fake_tui.chunks) >= 1
+
+    @pytest.mark.openai
+    @pytest.mark.flaky(reruns=1, reruns_delay=3)
+    async def test_tree_dedup_disabled_preserves_full_shape(self, tree_builder):
+        """dedup.exact=False reproduces the pre-deduplication tree shape.
+
+        This is where the strict degree**depth assertions live: without dedup
+        every generated subtopic becomes its own path, so the tree is fully
+        saturated. The dedup-on tests can only assert that as a ceiling.
+        """
+        degree = 2
+        depth = 1
+        topic = "AI Ethics"
+        tree = tree_builder(topic_prompt=topic, degree=degree, depth=depth, dedup={"exact": False})
+
+        events = await self._run_build(tree)
+
+        completes = [e for e in events if e.get("event") == "build_complete"]
+        assert len(completes) == 1
+        assert completes[0]["total_paths"] == degree**depth
+        assert completes[0]["duplicates_collapsed"] == 0
+
+        paths = tree.get_all_paths()
+        assert_topic_build_result(
+            paths, tree, min_paths=degree**depth, context="tree dedup disabled"
+        )
+        assert all(len(p) == depth + 1 for p in paths)
+        assert all(p[0] == topic for p in paths)

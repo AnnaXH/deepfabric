@@ -473,10 +473,13 @@ class TestGraph:
         assert topic_graph.failed_generations[0]["node_id"] == 0
         assert "API Error" in topic_graph.failed_generations[0]["last_error"]
 
-    def test_build(self, topic_graph):
-        """Test building the entire graph."""
+    def test_build(self, topic_graph_params):
+        """Test building the entire graph without deduplication."""
         # Mock responses for each call
         from deepfabric.schemas import GraphSubtopic, GraphSubtopics  # noqa: PLC0415
+
+        with patch("deepfabric.graph.LLMClient"):
+            topic_graph = Graph(**topic_graph_params, dedup={"exact": False})
 
         topic_graph.llm_client.generate_async = AsyncMock(
             return_value=GraphSubtopics(
@@ -492,6 +495,27 @@ class TestGraph:
         # With depth=2 and degree=3, we should have:
         # 1 root + 3 children + (3 * 3) grandchildren = 13 nodes
         assert len(topic_graph.nodes) == 13  # noqa: PLR2004
+
+    def test_build_with_dedup(self, topic_graph):
+        """Every node re-derives the same subtopics, so dedup collapses them."""
+        from deepfabric.schemas import GraphSubtopic, GraphSubtopics  # noqa: PLC0415
+
+        topic_graph.llm_client.generate_async = AsyncMock(
+            return_value=GraphSubtopics(
+                subtopics=[
+                    GraphSubtopic(topic=f"Topic {i}", connections=[])
+                    for i in range(topic_graph.degree)
+                ]
+            )
+        )
+
+        asyncio.run(_consume_async_iter(topic_graph.build_async()))
+
+        # Depth 2 re-derives the same three topics, which become edges to the
+        # existing nodes: 1 root + 3 children, no grandchildren.
+        assert len(topic_graph.nodes) == 4  # noqa: PLR2004
+        assert topic_graph.dedup_stats.duplicates_collapsed == 9  # noqa: PLR2004
+        assert not topic_graph.has_cycle()
 
 
 class TestIntegration:

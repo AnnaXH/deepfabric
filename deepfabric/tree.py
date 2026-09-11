@@ -16,6 +16,7 @@ from .constants import (
     TOPIC_TREE_DEFAULT_MODEL,
     TOPIC_TREE_DEFAULT_TEMPERATURE,
 )
+from .dedup import DedupConfig
 from .exceptions import TreeError
 from .llm import LLMClient
 from .metrics import trace
@@ -94,6 +95,10 @@ class TreeConfig(BaseModel):
         ge=1,
         description="Maximum tokens for topic generation LLM calls",
     )
+    dedup: DedupConfig = Field(
+        default_factory=DedupConfig,
+        description="Exact duplicate-topic detection and handling",
+    )
 
 
 class TreeValidator:
@@ -161,6 +166,13 @@ class Tree(TopicModel):
         self.model_name = self.config.model_name
         self.max_concurrent = self.config.max_concurrent
         self.max_tokens = self.config.max_tokens
+
+        # Exact-duplicate detection: hash index, counters and resolved on_duplicate
+        try:
+            self._init_dedup(self.config.dedup)
+        except ValueError as e:
+            raise TreeError(str(e)) from e
+        self.dedup_register(self.topic_prompt, self._path_to_id([self.topic_prompt]))
 
         # Initialize LLM client
         llm_kwargs = {}
@@ -237,6 +249,8 @@ class Tree(TopicModel):
                     "total_paths": len(self.tree_paths),
                     "failed_generations": len(self.failed_generations),
                     "success": len(self.tree_paths) > 0,
+                    "duplicates_collapsed": self.dedup_stats.duplicates_collapsed,
+                    "effective_degree": self.dedup_stats.effective_degree,
                 },
             )
 
@@ -244,6 +258,7 @@ class Tree(TopicModel):
                 "event": "build_complete",
                 "total_paths": len(self.tree_paths),
                 "failed_generations": len(self.failed_generations),
+                **self.dedup_stats.as_event(),
             }
         except Exception as e:
             yield {"event": "error", "error": str(e)}
@@ -281,8 +296,10 @@ class Tree(TopicModel):
     def get_unique_topics(self) -> list[Topic]:
         """Returns all leaf topics with computed IDs.
 
-        For Trees, each path is unique by definition, so this returns
-        all leaf topics with deterministic path-based IDs.
+        Paths are distinct by construction (each is a different route through
+        the tree), so this collapses nothing on its own — it is a one-Topic-per-
+        path view, not a deduplication step. Duplicate topic strings are removed
+        at insertion time by the hash index instead.
 
         Returns:
             List of Topic namedtuples containing (uuid, topic).
@@ -338,6 +355,78 @@ class Tree(TopicModel):
             )
             return []
 
+    def _dedupe_subtopics(
+        self, subtopics: list[str], node_path: list[str]
+    ) -> tuple[list[str], int]:
+        """Drop subtopics whose normalised form already exists in the tree.
+
+        A tree cannot express a shared node, so a duplicate is dropped rather
+        than merged. Kept subtopics are registered immediately, which also
+        collapses duplicates repeated inside a single response.
+
+        Args:
+            subtopics: Subtopic strings as returned by the model.
+            node_path: Path of the parent node being expanded.
+
+        Returns:
+            A tuple of (subtopics to expand, number collapsed).
+        """
+        kept: list[str] = []
+        collapsed = 0
+
+        for subtopic in subtopics:
+            if self.dedup_lookup(subtopic) is not None:
+                self.dedup_stats.duplicates_detected += 1
+                if self.dedup_action != "keep":
+                    collapsed += 1
+                    continue
+                # keep: detection only - the duplicate is still expanded
+            self.dedup_register(subtopic, self._path_to_id([*node_path, subtopic]))
+            kept.append(subtopic)
+
+        return kept, collapsed
+
+    async def _get_deduped_subtopics(
+        self, system_prompt: str, node_path: list[str], n_child: int
+    ) -> tuple[list[str], list[str], int]:
+        """Generate subtopics for a node and remove exact duplicates.
+
+        Collapsing duplicates leaves the node with fewer than ``n_child``
+        children. That reduced degree is accepted and reported unless backfill
+        is enabled, in which case only the shortfall is re-requested, capped by
+        ``dedup.backfill.max_attempts`` so expansion always terminates.
+
+        Args:
+            system_prompt: System prompt for topic generation.
+            node_path: Path of the parent node being expanded.
+            n_child: Requested number of children.
+
+        Returns:
+            A tuple of (raw subtopics from the first call, subtopics to expand,
+            number collapsed as duplicates).
+        """
+        self.dedup_stats.expansions += 1
+        raw = await self.get_subtopics(system_prompt, node_path, n_child)
+        kept, collapsed = self._dedupe_subtopics(raw, node_path)
+
+        backfill = self.dedup.backfill
+        if self.dedup.exact and backfill.enabled and raw:
+            for _ in range(backfill.max_attempts):
+                shortfall = n_child - len(kept)
+                if shortfall <= 0:
+                    break
+                self.dedup_stats.backfill_requests += 1
+                extra = await self.get_subtopics(system_prompt, node_path, shortfall)
+                if not extra:
+                    break
+                more_kept, more_collapsed = self._dedupe_subtopics(extra, node_path)
+                kept.extend(more_kept)
+                collapsed += more_collapsed
+
+        self.dedup_stats.duplicates_collapsed += collapsed
+        self.dedup_stats.subtopics_added += len(kept)
+        return raw, kept, collapsed
+
     def _detect_domain(self, system_prompt: str, node_path: list[str]) -> str:
         """Detect the appropriate domain for prompt examples based on context."""
         combined_text = f"{system_prompt} {' '.join(node_path)}".lower()
@@ -386,13 +475,18 @@ class Tree(TopicModel):
             yield {"event": "leaf_reached", "path": node_path}
             return
 
-        subtopics = await self.get_subtopics(system_prompt, node_path, n_child)
+        generated, subtopics, duplicates_collapsed = await self._get_deduped_subtopics(
+            system_prompt, node_path, n_child
+        )
 
         event = {
             "event": "subtopics_generated",
             "parent_path": node_path,
             "count": len(subtopics),
-            "success": bool(subtopics),
+            # Success reflects generation; an expansion fully collapsed by
+            # dedup generated fine, it just added nothing new.
+            "success": bool(generated),
+            "duplicates_collapsed": duplicates_collapsed,
         }
 
         # Include error information if generation failed
@@ -498,3 +592,10 @@ class Tree(TopicModel):
                 self.tree_paths.append(d["path"])
             elif "failed_generation" in d:
                 self.failed_generations.append(d["failed_generation"])
+
+        # Rebuild the dedup index so continued building sees the loaded topics.
+        self.dedup_rebuild_index(
+            (topic, self._path_to_id(path[: index + 1]))
+            for path in self.tree_paths
+            for index, topic in enumerate(path)
+        )
