@@ -21,6 +21,32 @@ TOPIC_TREE_DEFAULT_DEPTH = 3
 TOPIC_TREE_DEFAULT_TEMPERATURE = 0.2
 TOPIC_TREE_DEFAULT_MODEL = "gpt-4o"
 
+# Topic deduplication defaults
+DEDUP_DEFAULT_BACKFILL_MAX_ATTEMPTS = 2
+DEDUP_MAX_BACKFILL_ATTEMPTS = 10
+# Conservative English stopword list, only consulted when
+# normalise.strip_stopwords is explicitly enabled (off by default).
+DEDUP_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+)
+
 # Topic graph defaults
 TOPIC_GRAPH_DEFAULT_DEGREE = 10
 TOPIC_GRAPH_DEFAULT_DEPTH = 3
