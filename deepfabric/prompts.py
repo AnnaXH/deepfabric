@@ -391,3 +391,97 @@ Create challenging reasoning problems suitable for training systematic problem-s
 {{{{instructions}}}}
 {{{{examples}}}}
 {{{{subtopics}}}}"""
+
+
+# Verbalized sampling: ask for a distribution of candidate samples rather than one
+VERBALIZED_DISTRIBUTION_INSTRUCTIONS = """
+VERBALIZED SAMPLING - RETURN A DISTRIBUTION, NOT ONE SAMPLE:
+Instead of the single most likely training sample, generate {k} genuinely different candidates
+for the topic above, and report how likely each one is.
+
+For each candidate provide:
+- approach: a few words naming what makes this candidate different from the others
+- probability: your estimate, between 0 and 1, of how likely this candidate is as a response to
+  the request above. The most stereotypical candidate scores high, unusual ones score low.
+  These values do not need to sum to 1 - report them honestly rather than spreading them evenly.
+- payload: the complete training sample for that approach, in full, valid on its own
+
+Spread the candidates across the whole distribution, including its tail:
+- vary WHO is asking (their expertise, role, and what they already know)
+- vary WHAT is asked (the angle on the topic, the specifics, the difficulty)
+- vary HOW it is asked (framing, length, register, how well-posed the question is)
+- vary the SHAPE of the answer (explanation, comparison, walkthrough, correction, trade-off)
+
+Do not produce {k} rewordings of the same sample: each candidate must be usable as an independent
+training example, and every candidate must meet every requirement stated above in full."""
+
+VERBALIZED_STYLE_GUIDANCE = {
+    "basic": (
+        "Each payload is a complete conversation: one 'user' message posing the request and one "
+        "'assistant' message answering it. Vary the user's situation and the answer's structure "
+        "across candidates, not just the wording."
+    ),
+    "cot-freetext": (
+        "Each payload is a complete reasoning sample with natural, conversational reasoning "
+        "content. Vary the problem itself and the route taken through it across candidates - "
+        "different starting points, different false starts, different ways of checking the answer "
+        "- not just different phrasing of the same chain of thought."
+    ),
+    "cot-agent": (
+        "Each payload is a complete sample with structured reasoning steps. Vary the task, the "
+        "decomposition into steps, and the order in which the problem is attacked across "
+        "candidates, not just the wording of each step."
+    ),
+}
+
+
+class VerbalizedPromptBuilder:
+    """Build distribution-generation prompts for verbalized sampling (spec §6)."""
+
+    @staticmethod
+    def style_key(conversation_type: str, reasoning_style: str | None) -> str:
+        """Map a conversation configuration to a guidance key.
+
+        Args:
+            conversation_type: Base conversation type ('basic' or 'cot').
+            reasoning_style: Reasoning style for 'cot' ('freetext' or 'agent').
+
+        Returns:
+            Key into VERBALIZED_STYLE_GUIDANCE, falling back to 'basic'.
+        """
+        if conversation_type == "cot" and reasoning_style:
+            key = f"cot-{reasoning_style}"
+            if key in VERBALIZED_STYLE_GUIDANCE:
+                return key
+        return "basic"
+
+    @staticmethod
+    def build_distribution_prompt(
+        base_prompt: str,
+        k: int,
+        conversation_type: str = "basic",
+        reasoning_style: str | None = None,
+    ) -> str:
+        """Wrap a single-sample generation prompt in distribution instructions.
+
+        The base prompt is left untouched so every requirement it states (system
+        prompt, topic path, schema rules, retry feedback) still applies to each
+        candidate.
+
+        Args:
+            base_prompt: The prompt that would have generated one sample.
+            k: Number of candidates to verbalise.
+            conversation_type: Base conversation type ('basic' or 'cot').
+            reasoning_style: Reasoning style for 'cot' conversations.
+
+        Returns:
+            Complete distribution prompt for the LLM.
+        """
+        style = VerbalizedPromptBuilder.style_key(conversation_type, reasoning_style)
+        return "\n".join(
+            [
+                base_prompt,
+                VERBALIZED_DISTRIBUTION_INSTRUCTIONS.format(k=k),
+                f"\n{VERBALIZED_STYLE_GUIDANCE[style]}",
+            ]
+        )
