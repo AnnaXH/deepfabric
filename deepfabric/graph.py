@@ -193,6 +193,10 @@ class Graph(TopicModel):
 
         self.root: Node = Node(self.config.topic_prompt, 0)
         self.nodes: dict[int, Node] = {0: self.root}
+        # Built lazily; graph mutation methods invalidate it.
+        # Limitation: direct node or UUID edits bypass invalidation.
+        # Not handled because DeepFabric currently makes no such edits.
+        self._node_ids_by_uuid: dict[str, int] | None = None
         self._next_node_id: int = 1
         self.failed_generations: list[dict[str, Any]] = []
 
@@ -204,6 +208,7 @@ class Graph(TopicModel):
         """Adds a new node to the graph."""
         node = Node(topic, self._next_node_id, metadata)
         self.nodes[node.id] = node
+        self._node_ids_by_uuid = None
         self._next_node_id += 1
         return node
 
@@ -226,10 +231,24 @@ class Graph(TopicModel):
         Returns:
             The Node if found, None otherwise.
         """
-        for node in self.nodes.values():
-            if node.metadata.get("uuid") == uuid:
-                return node
-        return None
+        if self._node_ids_by_uuid is None:
+            self._node_ids_by_uuid = {}
+            for node in self.nodes.values():
+                node_uuid = node.metadata.get("uuid")
+                if node_uuid:
+                    # Preserve the first matching node if imported UUIDs repeat.
+                    self._node_ids_by_uuid.setdefault(node_uuid, node.id)
+        node_id = self._node_ids_by_uuid.get(uuid)
+        return self.nodes.get(node_id) if node_id is not None else None
+
+    def get_path_by_id(self, topic_id: str) -> list[str] | None:
+        """Return ancestry for any node UUID, including interior nodes.
+
+        Multi-parent nodes use their first parent as the canonical ancestry.
+        Root-to-leaf path enumeration remains independent of this lookup.
+        """
+        node = self.find_node_by_uuid(topic_id)
+        return self._get_path_to_node(node) if node is not None else None
 
     def remove_node(self, node_id: int) -> None:
         """Remove a single node from the graph, cleaning up bidirectional references.
@@ -257,6 +276,7 @@ class Graph(TopicModel):
                 child.parents.remove(node)
 
         del self.nodes[node_id]
+        self._node_ids_by_uuid = None
 
     def remove_subtree(self, node_id: int) -> list[int]:
         """Remove a node and all its descendants from the graph.
@@ -347,6 +367,7 @@ class Graph(TopicModel):
                 if node in child.parents:
                     child.parents.remove(node)
             del self.nodes[nid]
+        self._node_ids_by_uuid = None
 
         return list(to_remove_set)
 
@@ -392,6 +413,7 @@ class Graph(TopicModel):
         graph_model = GraphModel(**data)
         graph = cls(**params)
         graph.nodes = {}
+        graph._node_ids_by_uuid = None
 
         # Restore original creation timestamp if present in the loaded graph
         if graph_model.metadata and graph_model.metadata.created_at:
@@ -682,10 +704,12 @@ class Graph(TopicModel):
         return None
 
     def _get_path_to_node(self, node: Node) -> list[str]:
-        """Get the topic path from root to the given node."""
+        """Follow first parents to the root, stopping before repeating a node."""
         path = []
+        visited: set[int] = set()
         current = node
-        while current is not None:
+        while current is not None and current.id not in visited:
+            visited.add(current.id)
             path.append(current.topic)
             # First parent is the primary parent from tree expansion;
             # cross-connections are added later and appear after index 0
