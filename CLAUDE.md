@@ -60,7 +60,18 @@ The engine includes robust JSON parsing with regex extraction and retry logic fo
 - Comprehensive error reporting in final summary
 
 ### Topic Path Context in Generation
-Dataset generation must always pass the **full hierarchical path** (root -> ... -> leaf) to `build_prompt()`, not just the leaf topic text. This applies to all generation modes (step-based and cycle-based). The full path provides essential context for the LLM to generate domain-specific samples. When modifying generation logic, verify that `subtopics_list` receives the complete path from `TopicModel.get_path_by_id()` or `TopicPath.path`, never just the leaf text in isolation.
+Dataset generation must pass the **full hierarchical path** to the target topic (root → ... → topic) to `build_prompt()`, including when the target is an interior graph node. The full path provides essential context for the LLM to generate domain-specific samples.
+
+Graph generation targets every non-root node, so interior nodes are generation targets in their own right, not merely waypoints on a route to a leaf.
+
+Cycle-based generation resolves each unique topic through `TopicModel.get_path_by_id()`. Graph overrides this method to follow first-parent ancestry; Tree uses the inherited lookup over enumerated leaf paths.
+
+Two distinct questions, two distinct methods - do not substitute one for the other:
+
+- `get_path_by_id(uuid)` - "what is this node's ancestry?" Resolves any node, interior ones included, by walking first parents to the root. A node with several parents gets one canonical ancestry via its first parent (the primary expansion parent; cross-connections are appended after it).
+- `get_all_paths_with_ids()` - "what are the root-to-leaf routes?" Enumerates complete routes, keyed by leaf UUID. It cannot answer ancestry for an interior node, and `Graph.get_path_by_id()` does not call it.
+
+Verify that `subtopics_list` receives the complete path, never the target topic text alone when hierarchical context is available.
 
 ### System Message Control
 The `sys_msg` parameter controls whether system messages are included in the final dataset format - this affects training data structure.

@@ -1904,7 +1904,7 @@ class DataSetGenerator:
                         Tuple of (completed_item, success, count)
                     """
                     async with semaphore:
-                        # Recover full path context (root -> ... -> leaf) for prompt quality
+                        # Recover full path context (root -> ... -> topic) for prompt quality
                         full_path = topic_model.get_path_by_id(topic.uuid) if topic_model else None
                         subtopics = full_path if full_path else [topic.topic]
 

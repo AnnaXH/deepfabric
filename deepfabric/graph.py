@@ -246,6 +246,12 @@ class Graph(TopicModel):
 
         Multi-parent nodes use their first parent as the canonical ancestry.
         Root-to-leaf path enumeration remains independent of this lookup.
+
+        Args:
+            topic_id: The node UUID to resolve.
+
+        Returns:
+            The root-to-node path, or None if no node carries this UUID.
         """
         node = self.find_node_by_uuid(topic_id)
         return self._get_path_to_node(node) if node is not None else None

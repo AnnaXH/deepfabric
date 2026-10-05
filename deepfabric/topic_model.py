@@ -66,8 +66,8 @@ class TopicModel(ABC):
     def get_path_by_id(self, topic_id: str) -> list[str] | None:
         """Look up a path by its topic_id.
 
-        Searches enumerated leaf paths by default. Subclasses may override
-        this method to support lookups for non-leaf topics.
+        Searches enumerated leaf paths by default. Subclasses (e.g. graph)
+        may override this method to support lookups for non-leaf topics.
 
         Args:
             topic_id: The unique identifier for a topic path.
