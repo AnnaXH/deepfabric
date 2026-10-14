@@ -222,6 +222,16 @@ class Graph(TopicModel):
             if parent_node not in child_node.parents:
                 child_node.parents.append(parent_node)
 
+    def _build_node_ids_by_uuid(self) -> dict[str, int]:
+        """Build the UUID index, preserving the first node for duplicate UUIDs."""
+        node_ids_by_uuid: dict[str, int] = {}
+        for node in self.nodes.values():
+            node_uuid = node.metadata.get("uuid")
+            if node_uuid:
+                # Preserve the first matching node if imported UUIDs repeat.
+                node_ids_by_uuid.setdefault(node_uuid, node.id)
+        return node_ids_by_uuid
+
     def find_node_by_uuid(self, uuid: str) -> Node | None:
         """Find a node by its UUID.
 
@@ -232,12 +242,7 @@ class Graph(TopicModel):
             The Node if found, None otherwise.
         """
         if self._node_ids_by_uuid is None:
-            self._node_ids_by_uuid = {}
-            for node in self.nodes.values():
-                node_uuid = node.metadata.get("uuid")
-                if node_uuid:
-                    # Preserve the first matching node if imported UUIDs repeat.
-                    self._node_ids_by_uuid.setdefault(node_uuid, node.id)
+            self._node_ids_by_uuid = self._build_node_ids_by_uuid()
         node_id = self._node_ids_by_uuid.get(uuid)
         return self.nodes.get(node_id) if node_id is not None else None
 
