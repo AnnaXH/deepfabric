@@ -204,11 +204,15 @@ class Graph(TopicModel):
         """Wrap text to a specified width."""
         return "\n".join(textwrap.wrap(text, width=width))
 
+    def _clear_uuid_index(self) -> None:
+        """Clear the cached UUID index so the next lookup rebuilds it."""
+        self._node_ids_by_uuid = None
+
     def add_node(self, topic: str, metadata: dict[str, Any] | None = None) -> Node:
         """Adds a new node to the graph."""
         node = Node(topic, self._next_node_id, metadata)
         self.nodes[node.id] = node
-        self._node_ids_by_uuid = None
+        self._clear_uuid_index()
         self._next_node_id += 1
         return node
 
@@ -287,7 +291,7 @@ class Graph(TopicModel):
                 child.parents.remove(node)
 
         del self.nodes[node_id]
-        self._node_ids_by_uuid = None
+        self._clear_uuid_index()
 
     def remove_subtree(self, node_id: int) -> list[int]:
         """Remove a node and all its descendants from the graph.
@@ -378,7 +382,7 @@ class Graph(TopicModel):
                 if node in child.parents:
                     child.parents.remove(node)
             del self.nodes[nid]
-        self._node_ids_by_uuid = None
+        self._clear_uuid_index()
 
         return list(to_remove_set)
 
@@ -424,7 +428,7 @@ class Graph(TopicModel):
         graph_model = GraphModel(**data)
         graph = cls(**params)
         graph.nodes = {}
-        graph._node_ids_by_uuid = None
+        graph._clear_uuid_index()
 
         # Restore original creation timestamp if present in the loaded graph
         if graph_model.metadata and graph_model.metadata.created_at:
