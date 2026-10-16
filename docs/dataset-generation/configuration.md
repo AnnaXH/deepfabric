@@ -240,8 +240,10 @@ Controls final dataset.
     `num_samples` supports special values:
 
     - **Integer** (e.g., `100`): Generate exactly this many samples
-    - **`"auto"`**: Generate one sample per unique topic (100% coverage)
-    - **Percentage** (e.g., `"50%"`, `"200%"`): Generate samples relative to unique topic count
+    - **`"auto"`**: Sample count equals the number of root-to-leaf paths in the topic model
+    - **Percentage** (e.g., `"50%"`, `"200%"`): Sample count relative to that same path count
+
+    For trees, path count equals unique topic count. For graphs the two differ — paths are root-to-leaf routes, while generation cycles over every node — so `"auto"` on a graph does not guarantee one sample per topic.
 
     When `num_samples` exceeds the number of unique topics, DeepFabric iterates through multiple **cycles**. Each cycle processes all unique topics once. For example, with 50 unique topics and `num_samples: 120`:
 
@@ -283,7 +285,7 @@ Checkpointing creates three files in the checkpoint directory:
 !!! info "Cycle-Based Generation Model"
     DeepFabric uses a cycle-based generation model:
 
-    - **Unique topics**: Deduplicated topics from your tree/graph (by UUID)
+    - **Unique topics**: One per leaf path (tree) or per non-root node (graph)
     - **Cycles**: Number of times to iterate through all unique topics
     - **Concurrency**: Maximum parallel LLM calls (`batch_size`)
 

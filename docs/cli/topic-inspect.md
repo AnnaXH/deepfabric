@@ -10,6 +10,9 @@ deepfabric topic inspect topics.json
 
 The command auto-detects whether the file is a tree (JSONL) or graph (JSON) and displays a summary with format, total paths, max depth, and metadata.
 
+!!! info "What `total_paths` counts"
+    `total_paths` is the number of root-to-leaf routes. For graphs this is not the number of generation targets, which is every non-root node, interior nodes included.
+
 ## Options
 
 | Option | Short | Description |

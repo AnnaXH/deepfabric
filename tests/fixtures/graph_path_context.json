@@ -1,0 +1,33 @@
+{
+  "nodes": {
+    "0": {
+      "id": 0,
+      "topic": "Root",
+      "children": [1],
+      "parents": [],
+      "metadata": {"uuid": "00000000-0000-4000-8000-000000000000"}
+    },
+    "1": {
+      "id": 1,
+      "topic": "Branch",
+      "children": [2],
+      "parents": [0],
+      "metadata": {"uuid": "00000000-0000-4000-8000-000000000001"}
+    },
+    "2": {
+      "id": 2,
+      "topic": "Interior",
+      "children": [3],
+      "parents": [1],
+      "metadata": {"uuid": "00000000-0000-4000-8000-000000000002"}
+    },
+    "3": {
+      "id": 3,
+      "topic": "Leaf",
+      "children": [],
+      "parents": [2],
+      "metadata": {"uuid": "00000000-0000-4000-8000-000000000003"}
+    }
+  },
+  "root_id": 0
+}
