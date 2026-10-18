@@ -110,14 +110,14 @@ deepfabric generate config.yaml \
 | Parameter | Description |
 |-----------|-------------|
 | `--num-samples` | Total samples: integer, `auto`, or percentage (e.g., `50%`, `200%`) |
-| `--batch-size` | Affects generation speed and resource usage |
+| `--batch-size` | Maximum concurrent topic tasks; samples within a topic are sequential |
 | `--include-system-message` | Include system prompts in training examples |
 | `--no-system-message` | Exclude system prompts from training examples |
 
 !!! tip "Automatic Sample Count"
-    Use `--num-samples auto` to generate exactly one sample per topic path. Use percentages like `--num-samples 50%` for partial coverage or `--num-samples 200%` to cycle through topics multiple times.
+    Use `--num-samples auto` to allocate one sample per unique topic (tree leaf or non-root graph node). Use `--num-samples 50%` to select the existing ordered prefix, or `--num-samples 200%` for two slots per topic in one pass. Terminal failures can reduce successful output rows.
 
-    Integer values larger than the number of topic paths work the same way—`--num-samples 100` with 50 paths is equivalent to `--num-samples 200%`.
+    Integer targets use the same allocation: `--num-samples 100` with 50 unique topics is equivalent to `--num-samples 200%`. Targets are never rounded to a batch multiple.
 
 ## Conversation Type Options
 
