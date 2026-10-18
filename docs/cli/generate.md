@@ -249,7 +249,11 @@ On resume, the generator:
 - Optionally retries failed samples with `--retry-failed`
 
 !!! info "Memory Optimization"
-    When checkpointing is enabled, samples are flushed to disk periodically, keeping memory usage constant regardless of dataset size. This allows generating datasets with 50,000+ samples without memory issues.
+    Checkpointing periodically flushes samples to disk, reducing sample buffering during generation. Completion identities remain in memory, and final dataset assembly loads the saved rows.
+
+### Migrating Older Checkpoints
+
+Version 4 checkpoints require migration before resuming. See [Migrating Version 4 Checkpoints](../dataset-generation/configuration.md#migrating-version-4-checkpoints) for the helper command and required inputs.
 
 ### Graceful Stop
 
@@ -281,6 +285,8 @@ This prevents accidentally overwriting or corrupting existing checkpoint data.
 
 !!! warning "Partial Failures"
     When generation fails partway through, the system saves intermediate results where possible. Topic trees are saved incrementally, enabling recovery by loading partial results and continuing from the dataset generation stage. With checkpointing enabled, dataset generation progress is also preserved.
+
+Generation errors and handled interruptions can also save partial dataset exports. See [Partial Results After Errors or Interruptions](../dataset-generation/configuration.md#partial-results-after-errors-or-interruptions) for filenames and recovery behavior.
 
 ??? tip "Optimizing Generation Performance"
     Balance `batch-size` with your API rate limits and system resources. Larger batches increase throughput but consume more memory and may trigger rate limiting. Start with smaller batches and increase based on your provider's capabilities.

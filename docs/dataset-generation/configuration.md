@@ -294,15 +294,17 @@ Version 5 checkpoints store per-slot identities and exact allocation plans. Vers
 
 ```bash
 python tools/migrate_checkpoint.py \
-  --checkpoint old/dataset.checkpoint.json \
+  --checkpoint-dir old-checkpoints \
   --config original-config.yaml \
   --topics original-topics.json \
   --output-dir migrated-checkpoints
 ```
 
-Supported migrations: **v4 -> v5**, for validated topic-model checkpoints. Use a new destination directory; source files are preserved. Supply original overrides with `--num-samples`, `--batch-size`, or `--num-steps` if applicable. The helper rejects ambiguous/missing identities, inconsistent input, and unsupported checkpoint modes.
+Use `--checkpoint-dir DIR` when the directory contains exactly one checkpoint, or `--checkpoint FILE` to select its metadata explicitly. The tool finds the associated samples and failures in the same directory.
 
-Migration preserves the original effective target, including old batch rounding. For an old request of 25 and batch size 10, the migrated target remains 30. The helper prints the exact resume command/target; using the smaller original target is rejected rather than discarding completed rows.
+Supported migrations: **v4 -> v5**, for topic-model checkpoints with the original configuration and saved topics. Migration preserves the originals and requires a new destination directory. Supply original overrides with `--num-samples`, `--batch-size`, or `--num-steps` if applicable. Ambiguous identities, inconsistent inputs, and unsupported checkpoint modes are rejected.
+
+Migration preserves the original effective target, including old batch rounding. For an old request of 25 and batch size 10, the migrated target remains 30. Use the exact resume command printed by the helper. If migration is forcibly terminated, remove any incomplete destination before retrying.
 
 #### Python Exact Targets
 
@@ -313,6 +315,23 @@ dataset = engine.create_data(num_samples=25, batch_size=10, topic_model=tree)
 ```
 
 Without a topic model, generation uses sequential sample batches, including a final short batch. Target 25/batch size 10 schedules 10, 10, and 5 slots and logs the short batch at info level.
+
+#### Python Generator Reuse and Resume
+
+Each Python generation call starts fresh unless you first call `engine.load_checkpoint()`. A successful load selects resume for the next call, which must use the same target, topic plan, and checkpoint location with checkpointing enabled.
+
+```python
+if engine.load_checkpoint():
+    dataset = engine.create_data(num_samples=25, batch_size=10, topic_model=tree)
+```
+
+With checkpointing enabled, a fresh run refuses an existing checkpoint at its destination. Load it to resume, or choose a new checkpoint location for a fresh run.
+
+#### Partial Results After Errors or Interruptions
+
+On a fatal generation error, the generator attempts to save successful partial rows to `error_dataset.jsonl` in the current working directory, then raises `DataSetGeneratorError`. A handled `KeyboardInterrupt` instead saves `interrupted_dataset.jsonl` and returns partial results. Both exports include checkpointed rows; save failures are logged.
+
+To resume, use the checkpoint set rather than these row-only exports. The CLI's normal stop behavior is described in [Graceful Stop](../cli/generate.md#graceful-stop).
 
 !!! tip "Memory Optimization"
     When checkpointing is enabled, samples are flushed to disk periodically, reducing in-memory sample storage during generation. Completion identities remain in memory, and final dataset assembly loads the saved rows.
