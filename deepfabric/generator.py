@@ -7,6 +7,7 @@ import random
 
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -14,7 +15,7 @@ from datasets import Dataset as HFDataset
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .builders import ConversationBuilderFactory
-from .checkpoint import read_jsonl, validate_checkpoint, version_error
+from .checkpoint import iter_jsonl, read_jsonl, validate_checkpoint, version_error
 from .config import _normalize_reasoning_style
 from .constants import (
     API_ERROR_INDICATORS,
@@ -29,6 +30,8 @@ from .constants import (
     ENGINE_DEFAULT_NUM_EXAMPLES,
     ENGINE_DEFAULT_TEMPERATURE,
     ERROR_CATEGORIES,
+    ERROR_DATASET_FILENAME,
+    INTERRUPTED_DATASET_FILENAME,
 )
 from .error_codes import classify_error
 from .exceptions import DataSetGeneratorError
@@ -297,7 +300,7 @@ class DataSetGenerator:
         self._completed: set[tuple[str, int]] = set()  # Attempted (UUID, sample ordinal) slots
         self._sample_slots: list[tuple[str, int]] = []
         self._generation_plan: dict | None = None
-        self._checkpoint_loaded = False
+        self._checkpoint_loaded = False  # Explicit load pending consumption by one run
         self._checkpoint_metadata_path: Path | None = None
         self._checkpoint_samples_path: Path | None = None
         self._checkpoint_failures_path: Path | None = None
@@ -450,7 +453,6 @@ class DataSetGenerator:
 
         # Update metadata (after flush counts are updated)
         self._save_checkpoint_metadata()
-        self._checkpoint_loaded = True
 
         logger.debug(
             "Checkpoint saved: %d samples, %d failures, %d completed tuples (flushed=%s)",
@@ -578,6 +580,9 @@ class DataSetGenerator:
         if not valid:
             raise DataSetGeneratorError(error)
         self._validate_checkpoint_compatibility(metadata)
+        self._samples.clear()
+        self.failed_samples.clear()
+        self.stop_requested = False
         self._generation_plan = metadata["plan"]
         self._checkpoint_loaded = True
         self._completed = {tuple(item) for item in metadata["completed"]}
@@ -1203,11 +1208,7 @@ class DataSetGenerator:
             plan = self._prepare_topic_allocations(target, topic_model)
         else:
             plan = {"generation_mode": "step_based", "target": target}
-        if self._generation_plan is not None and self._generation_plan != plan:
-            raise DataSetGeneratorError(
-                "Checkpoint target/topic plan differs from the requested generation plan"
-            )
-        self._generation_plan = plan
+        self._prepare_generation_run(plan)
         if num_samples is not None and topic_model is None and target % batch_size:
             logger.info(
                 "Final step will generate %d samples (batch_size=%d) to match num_samples=%d.",
@@ -1237,6 +1238,62 @@ class DataSetGenerator:
                 yield event
         finally:
             await events.aclose()
+
+    def _prepare_generation_run(self, plan: dict) -> None:
+        """Consume explicit resume state once; ordinary invocations start independent runs."""
+        resuming = self._checkpoint_loaded
+        loaded_path = self._checkpoint_metadata_path if resuming else None
+        if resuming and self._generation_plan != plan:
+            raise DataSetGeneratorError(
+                "Checkpoint target/topic plan differs from the requested generation plan"
+            )
+        if resuming and self.config.checkpoint_interval is None:
+            raise DataSetGeneratorError(
+                "Checkpointing must remain enabled to resume a loaded checkpoint"
+            )
+        if self.config.checkpoint_interval is not None:
+            if resuming and self._get_checkpoint_paths()[0] != loaded_path:
+                raise DataSetGeneratorError(
+                    "Checkpoint location differs from the loaded checkpoint"
+                )
+            self._initialize_checkpoint_paths()
+            if self._checkpoint_metadata_path.exists():
+                with self._checkpoint_metadata_path.open(encoding="utf-8") as stream:
+                    existing = json.load(stream)
+                if existing.get("version") != CHECKPOINT_VERSION:
+                    raise DataSetGeneratorError(
+                        version_error(existing.get("version"), self._checkpoint_metadata_path)
+                    )
+                if not resuming:
+                    raise DataSetGeneratorError(
+                        "Existing checkpoint: call load_checkpoint() to resume, "
+                        "or use a separate checkpoint location for a new run"
+                    )
+            elif resuming:
+                raise DataSetGeneratorError("Loaded checkpoint metadata is missing")
+            elif any(
+                path.exists() and path.stat().st_size
+                for path in (self._checkpoint_samples_path, self._checkpoint_failures_path)
+            ):
+                raise DataSetGeneratorError(
+                    "Checkpoint outcome files exist without metadata; use a separate location"
+                )
+        if not resuming:
+            self._samples.clear()
+            self.failed_samples.clear()
+            self._completed.clear()
+            self._sample_slots.clear()
+            self._flushed_samples_count = 0
+            self._flushed_failures_count = 0
+            self.stop_requested = False
+            if self.config.checkpoint_interval is None:
+                self._checkpoint_metadata_path = None
+                self._checkpoint_samples_path = None
+                self._checkpoint_failures_path = None
+        self.failure_analysis = {category: [] for category in ERROR_CATEGORIES}
+        self._generation_plan = plan
+        # Resume is explicit for each invocation; saving a checkpoint does not select resume.
+        self._checkpoint_loaded = False
 
     async def _generate_sample_outcome(
         self,
@@ -1303,7 +1360,7 @@ class DataSetGenerator:
                 await queue.put(("outcome", (identity, sample, failure)))
                 # Let the result coordinator checkpoint and observe stop requests between slots.
                 await asyncio.sleep(0)
-        except Exception as exc:  # noqa: BLE001
+        except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001
             await queue.put(("error", exc))
         await queue.put(("done", None))
 
@@ -1345,33 +1402,41 @@ class DataSetGenerator:
     ):
         """Coordinate owned slot outcomes, persistence, and lifecycle for both strategies."""
         topic_based = plan["generation_mode"] == "topic_allocation"
-        if self.config.checkpoint_interval is not None:
-            self._initialize_checkpoint_paths()
-            if self._checkpoint_metadata_path.exists():
-                with self._checkpoint_metadata_path.open(encoding="utf-8") as stream:
-                    existing = json.load(stream)
-                if existing.get("version") != CHECKPOINT_VERSION:
-                    raise DataSetGeneratorError(
-                        version_error(existing.get("version"), self._checkpoint_metadata_path)
-                    )
-                if not self._checkpoint_loaded:
-                    raise DataSetGeneratorError(
-                        "Existing checkpoint: call load_checkpoint() to resume, "
-                        "or use a separate checkpoint location for a new run"
-                    )
-            elif any(
-                path.exists() and path.stat().st_size
-                for path in (self._checkpoint_samples_path, self._checkpoint_failures_path)
-            ):
-                raise DataSetGeneratorError(
-                    "Checkpoint outcome files exist without metadata; use a separate location"
-                )
         historical_samples = self._flushed_samples_count + len(self._samples)
         historical_failures = self._flushed_failures_count + len(self.failed_samples)
         skipped = len(self._completed)
         pending_samples, pending_failures, pending_slots, pending_completed = [], [], [], []
         tasks = []
+        queue = None
+        recovery_handled = False
         new_samples = new_failures = 0
+
+        def record_outcome(payload):
+            nonlocal new_samples, new_failures
+            identity, sample, failure = payload
+            self._completed.add(identity)
+            pending_completed.append(identity)
+            if sample is not None:
+                self._samples.append(sample)
+                pending_samples.append(sample)
+                pending_slots.append(identity)
+                new_samples += 1
+            else:
+                self.failed_samples.append(failure)
+                pending_failures.append(failure)
+                new_failures += 1
+
+        async def stop_workers(*, collect_outcomes=False):
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            tasks.clear()
+            if collect_outcomes and queue is not None:
+                while not queue.empty():
+                    kind, payload = queue.get_nowait()
+                    if kind == "outcome":
+                        record_outcome(payload)
 
         def flush():
             if self.config.checkpoint_interval is None or not pending_completed:
@@ -1474,7 +1539,7 @@ class DataSetGenerator:
                                         prompt, include_sys_msg, a["ordinal"], None, identity
                                     )
                                     await result_queue.put(("outcome", (identity, sample, failure)))
-                            except Exception as exc:  # noqa: BLE001
+                            except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001
                                 await result_queue.put(("error", exc))
                             await result_queue.put(("done", None))
 
@@ -1489,17 +1554,7 @@ class DataSetGenerator:
                     if kind == "error":
                         raise payload
                     identity, sample, failure = payload
-                    self._completed.add(identity)
-                    pending_completed.append(identity)
-                    if sample is not None:
-                        self._samples.append(sample)
-                        pending_samples.append(sample)
-                        pending_slots.append(identity)
-                        new_samples += 1
-                    else:
-                        self.failed_samples.append(failure)
-                        pending_failures.append(failure)
-                        new_failures += 1
+                    record_outcome(payload)
                     yield {
                         "event": "batch_complete",
                         "topic_id": identity[0],
@@ -1545,25 +1600,36 @@ class DataSetGenerator:
             else:
                 yield {"event": "generation_complete", **counts()}
         except (Exception, KeyboardInterrupt) as exc:
+            await stop_workers(collect_outcomes=True)
+            # Cleanup/export failures must not replace the generation error's original cause.
+            recovery_handled = True
+            try:
+                flush()
+            except Exception:  # noqa: BLE001
+                logger.exception("Unable to save checkpoint while recovering partial generation")
+            interrupted = isinstance(exc, KeyboardInterrupt)
+            fallback = INTERRUPTED_DATASET_FILENAME if interrupted else ERROR_DATASET_FILENAME
+            try:
+                self._save_samples_to_file(fallback, include_checkpoint=True)
+            except Exception:  # noqa: BLE001
+                logger.exception("Unable to save partial dataset to %s", fallback)
+            self.print_failure_summary()
             yield {
-                "event": "generation_error"
-                if isinstance(exc, Exception)
-                else "generation_interrupted",
+                "event": "generation_interrupted" if interrupted else "generation_error",
+                "message": "Generation interrupted by user." if interrupted else str(exc),
                 "error": str(exc),
                 **counts(),
             }
-            raise
+            if not interrupted:
+                raise DataSetGeneratorError("failed") from exc
         finally:
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            flush()
-        samples = (
-            self._load_all_samples_from_checkpoint()
-            if self._flushed_samples_count
-            else self._samples
-        )
+            await stop_workers()
+            if not recovery_handled:
+                flush()
+        samples = list(self._samples)
+        if self._flushed_samples_count:
+            saved = islice(iter_jsonl(self._checkpoint_samples_path), self._flushed_samples_count)
+            samples = list(saved) + samples
         yield HFDataset.from_list(samples)
 
     async def _process_batch_with_retries_async(
@@ -1755,10 +1821,15 @@ class DataSetGenerator:
         # Fallback to basic conversation prompt
         return CONVERSATION_GENERATION_PROMPT
 
-    def _save_samples_to_file(self, save_path: str):
-        """Save the current samples to a JSONL file."""
+    def _save_samples_to_file(self, save_path: str, *, include_checkpoint: bool = False):
+        """Save in-memory samples, optionally including checkpoint-backed partial results."""
 
         with open(save_path, "w", encoding="utf-8") as f:
+            if include_checkpoint and self._flushed_samples_count:
+                for sample in islice(
+                    iter_jsonl(self._checkpoint_samples_path), self._flushed_samples_count
+                ):
+                    f.write(json.dumps(sample, separators=(",", ":")) + "\n")
             for sample in self._samples:
                 f.write(json.dumps(sample, separators=(",", ":")) + "\n")
 
