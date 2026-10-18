@@ -3,6 +3,10 @@
 Supported migrations: v4 -> v5
 Scope: validated topic-model checkpoints with the original config and saved topics.
 No-topic checkpoints and ambiguous/inconsistent original plans are not supported.
+Select metadata with --checkpoint, or use --checkpoint-dir for a directory containing
+exactly one checkpoint. Migration writes .tmp files into a new destination directory,
+validates them, and removes their temporary suffixes, publishing metadata last.
+A hard termination may leave an incomplete destination; remove it before retrying.
 """
 # ruff: noqa: E402 - source-checkout bootstrap must precede DeepFabric imports
 
@@ -12,7 +16,6 @@ import os
 import shlex
 import shutil
 import sys
-import tempfile
 
 from collections import defaultdict, deque
 from pathlib import Path
@@ -169,30 +172,24 @@ def migrate_v4_to_v5(
     if output_dir.exists():
         raise DataSetGeneratorError("Migration destination already exists; choose a new directory")
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".checkpoint-migration-", dir=output_dir.parent))
-    reserved_destination = False
+    # Reserve the destination without overwriting another checkpoint set.
+    output_dir.mkdir()
     try:
-        out_metadata = staging / checkpoint.name
-        out_samples = staging / samples_path.name
-        out_failures = staging / failures_path.name
+        out_metadata = output_dir / (checkpoint.name + ".tmp")
+        out_samples = output_dir / (samples_path.name + ".tmp")
+        out_failures = output_dir / (failures_path.name + ".tmp")
         out_metadata.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         out_samples.write_text("".join(json.dumps(row) + "\n" for row in samples), encoding="utf-8")
         out_failures.write_text(
             "".join(json.dumps(row) + "\n" for row in migrated_failures), encoding="utf-8"
         )
         validate_checkpoint(metadata, out_samples, out_failures)
-        # mkdir reserves the destination without overwriting another checkpoint set.
-        output_dir.mkdir()
-        reserved_destination = True
         # Publish metadata last so a consumer never sees a resumable partial set.
         for source in (out_samples, out_failures, out_metadata):
-            os.replace(source, output_dir / source.name)
+            os.replace(source, source.with_suffix(""))
     except BaseException:
-        if reserved_destination:
-            shutil.rmtree(output_dir)
+        shutil.rmtree(output_dir)
         raise
-    finally:
-        shutil.rmtree(staging)
     return output_dir / checkpoint.name, requested, target
 
 
@@ -220,9 +217,34 @@ def migrate_checkpoint(
     return migration(checkpoint, config_path, topics_path, output_dir, **overrides)
 
 
+def discover_checkpoint(directory: Path) -> Path:
+    """Select the sole checkpoint metadata file directly inside a directory."""
+    if not directory.is_dir():
+        raise DataSetGeneratorError(
+            f"Checkpoint directory does not exist or is not a directory: {directory}"
+        )
+    candidates = sorted(
+        path for path in directory.glob(f"*{CHECKPOINT_METADATA_SUFFIX}") if path.is_file()
+    )
+    if not candidates:
+        raise DataSetGeneratorError(f"No checkpoint metadata found in {directory}")
+    if len(candidates) != 1:
+        names = ", ".join(path.name for path in candidates)
+        raise DataSetGeneratorError(
+            f"Multiple checkpoints found in {directory}: {names}; select one with --checkpoint"
+        )
+    return candidates[0]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True, type=Path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--checkpoint", type=Path, help="Checkpoint metadata JSON file")
+    source.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        help="Directory containing exactly one checkpoint metadata file",
+    )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--topics", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -234,8 +256,13 @@ def main(argv=None):
     parser.add_argument("--batch-size", type=int, help="Original run's overridden batch size")
     args = parser.parse_args(argv)
     try:
+        checkpoint = (
+            args.checkpoint
+            if args.checkpoint is not None
+            else discover_checkpoint(args.checkpoint_dir)
+        )
         path, requested, target = migrate_checkpoint(
-            args.checkpoint,
+            checkpoint,
             args.config,
             args.topics,
             args.output_dir,

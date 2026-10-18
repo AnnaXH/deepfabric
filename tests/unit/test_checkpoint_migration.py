@@ -2,6 +2,7 @@
 # ruff: noqa: PLR2004, ARG001
 
 import json
+import os
 import subprocess
 import sys
 
@@ -19,7 +20,9 @@ from deepfabric.constants import (
 from deepfabric.exceptions import DataSetGeneratorError
 from deepfabric.generator import DataSetGenerator
 from tools.migrate_checkpoint import (
+    discover_checkpoint,
     load_migration_topics,
+    main,
     migrate_checkpoint,
     migrate_v4_to_v5,
 )
@@ -168,15 +171,16 @@ def test_refuses_inconsistent_or_unsupported_input(original, problem):
         assert (destination / "keep").read_text() == "existing"
 
 
-def test_real_script_entry_point(original):
+@pytest.mark.parametrize("directory_input", [False, True])
+def test_real_script_entry_point(original, directory_input):
     metadata, config, topics, destination = original
     script = Path(__file__).resolve().parents[2] / "tools" / "migrate_checkpoint.py"
     result = subprocess.run(  # noqa: S603 - fixed local tool and temporary test paths
         [
             sys.executable,
             str(script),
-            "--checkpoint",
-            str(metadata),
+            "--checkpoint-dir" if directory_input else "--checkpoint",
+            str(metadata.parent if directory_input else metadata),
             "--config",
             str(config),
             "--topics",
@@ -208,3 +212,110 @@ def test_version_dispatch_rejects_unsupported_target(original):
     with pytest.raises(DataSetGeneratorError, match="Unsupported migration path 4 -> 6"):
         migrate_checkpoint(*original, target_version=6)
     assert not original[-1].exists()
+
+
+@pytest.mark.parametrize("problem", ["missing", "file", "empty", "multiple"])
+def test_checkpoint_directory_discovery_errors(original, tmp_path, problem):
+    metadata, _, _, _ = original
+    directory = tmp_path / "input"
+    if problem == "missing":
+        match = "does not exist or is not a directory"
+    elif problem == "file":
+        directory.write_text("not a directory")
+        match = "does not exist or is not a directory"
+    elif problem == "empty":
+        directory.mkdir()
+        # Nested checkpoints and unfinished metadata are not discovery candidates.
+        (directory / (metadata.name + ".tmp")).write_text("unfinished")
+        (directory / ("nested" + CHECKPOINT_METADATA_SUFFIX)).mkdir()
+        match = "No checkpoint metadata"
+    else:
+        directory = metadata.parent
+        (directory / ("other" + CHECKPOINT_METADATA_SUFFIX)).write_text("{}")
+        match = "Multiple checkpoints.*--checkpoint"
+    with pytest.raises(DataSetGeneratorError, match=match):
+        discover_checkpoint(directory)
+
+
+@pytest.mark.parametrize("both", [False, True])
+def test_cli_requires_exactly_one_checkpoint_source(original, both, capsys):
+    metadata, config, topics, destination = original
+    args = ["--config", str(config), "--topics", str(topics), "--output-dir", str(destination)]
+    if both:
+        args += ["--checkpoint", str(metadata), "--checkpoint-dir", str(metadata.parent)]
+    with pytest.raises(SystemExit) as error:
+        main(args)
+    assert error.value.code == 2
+    assert "--checkpoint" in capsys.readouterr().err
+    assert not destination.exists()
+
+
+def test_cli_reports_directory_discovery_error(original, capsys):
+    _, config, topics, destination = original
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "--checkpoint-dir",
+                str(destination),
+                "--config",
+                str(config),
+                "--topics",
+                str(topics),
+                "--output-dir",
+                str(destination),
+            ]
+        )
+    assert error.value.code == 1
+    assert "Migration failed: Checkpoint directory" in capsys.readouterr().err
+    assert not destination.exists()
+
+
+def test_temporary_files_validated_then_published_with_metadata_last(original):
+    metadata, _, _, destination = original
+    rename = os.replace
+    published = []
+
+    def publish(source, target):
+        assert source.parent == target.parent == destination
+        assert source.name == target.name + ".tmp"
+        assert not (destination / metadata.name).exists()
+        assert not list(destination.parent.glob(".checkpoint-migration-*"))
+        published.append(target.name)
+        rename(source, target)
+
+    with patch("tools.migrate_checkpoint.os.replace", side_effect=publish):
+        migrate_v4_to_v5(*original)
+    assert published == [
+        "samples" + CHECKPOINT_SAMPLES_SUFFIX,
+        "samples" + CHECKPOINT_FAILURES_SUFFIX,
+        metadata.name,
+    ]
+    assert sorted(p.name for p in destination.iterdir()) == sorted(published)
+
+
+@pytest.mark.parametrize("phase", ["validation", "samples", "failures", "metadata"])
+def test_failed_validation_or_publication_removes_new_destination(original, phase):
+    metadata, _, _, destination = original
+    before = {p: p.read_bytes() for p in metadata.parent.iterdir() if p.is_file()}
+    rename = os.replace
+
+    def publish(source, target):
+        suffix = {
+            "samples": CHECKPOINT_SAMPLES_SUFFIX,
+            "failures": CHECKPOINT_FAILURES_SUFFIX,
+            "metadata": CHECKPOINT_METADATA_SUFFIX,
+        }[phase]
+        if target.name.endswith(suffix):
+            raise OSError("publication failed")
+        rename(source, target)
+
+    target = "validate_checkpoint" if phase == "validation" else "os.replace"
+    failure = ValueError("validation failed") if phase == "validation" else publish
+    with (
+        patch(f"tools.migrate_checkpoint.{target}", side_effect=failure),
+        pytest.raises((ValueError, OSError), match="failed"),
+    ):
+        migrate_v4_to_v5(*original)
+    assert not destination.exists()
+    assert not list(destination.parent.glob(".checkpoint-migration-*"))
+    assert all(p.read_bytes() == content for p, content in before.items())
