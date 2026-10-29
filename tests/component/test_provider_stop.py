@@ -12,6 +12,7 @@ import openai
 import pytest
 
 from google.genai.errors import ClientError
+from outlines.exceptions import normalize_provider_exception
 
 from deepfabric.checkpoint import read_jsonl, validate_checkpoint
 from deepfabric.constants import ERROR_DATASET_FILENAME
@@ -264,7 +265,7 @@ async def test_exhausted_429_budget_stops_scheduling_not_just_one_slot(
     ],
 )
 @pytest.mark.parametrize("mode,scope", MODES)
-async def test_router_and_raw_ollama_stop_then_ordinary_resume(
+async def test_router_and_wrapped_ollama_stop_then_ordinary_resume(
     tmp_path, monkeypatch, provider, status, metadata, mode, scope
 ):
     monkeypatch.chdir(tmp_path)
@@ -281,6 +282,8 @@ async def test_router_and_raw_ollama_stop_then_ordinary_resume(
             "metadata": metadata,
         },
     )
+    if provider == "ollama":
+        error = normalize_provider_exception(error, "openai")
     model = Model(mode, scope, 1, error)
     engine = make_engine(tmp_path, model, mode, scope, provider=provider, retries=1)
     with patch("deepfabric.llm.retry_handler.asyncio.sleep", new=AsyncMock()):

@@ -8,6 +8,8 @@ from typing import Any
 import anthropic
 import openai
 
+from .provider_failure import unwrap_provider_exception
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +49,7 @@ class RateLimitDetector:
         Returns:
             True if the exception is a rate limit error
         """
+        exception = unwrap_provider_exception(exception)
         if provider == "openai":
             return isinstance(exception, openai.RateLimitError)
 
@@ -58,7 +61,7 @@ class RateLimitDetector:
             return "429" in error_str and "RESOURCE_EXHAUSTED" in error_str
 
         if provider == "ollama":
-            # Ollama uses OpenAI-compatible API, but rate limits are unlikely
+            # Ollama's OpenAI-compatible API errors may be wrapped by Outlines.
             return isinstance(exception, openai.RateLimitError)
 
         # Generic fallback: check for 429 in error message
@@ -78,6 +81,7 @@ class RateLimitDetector:
         Returns:
             True if the error is retryable
         """
+        exception = unwrap_provider_exception(exception)
         # Check if it's a rate limit error first
         if RateLimitDetector.is_rate_limit_error(exception, provider):
             return True
@@ -110,6 +114,7 @@ class RateLimitDetector:
         Returns:
             QuotaInfo object with parsed details
         """
+        exception = unwrap_provider_exception(exception)
         if provider == "openai":
             return RateLimitDetector._parse_openai_error(exception)
         if provider == "anthropic":

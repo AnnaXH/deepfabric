@@ -1204,6 +1204,7 @@ def make_outlines_model(provider: str, model_name: str, **kwargs) -> Any:
             return outlines.from_openai(client, model_name)
 
         if provider == "ollama":
+            kwargs = {**kwargs, "max_retries": 0}
             client = _create_openai_compatible_client(
                 api_key_env_var=None,  # No API key required
                 default_base_url="http://localhost:11434/v1",
@@ -1270,6 +1271,7 @@ def make_async_outlines_model(provider: str, model_name: str, **kwargs) -> Any |
             return outlines.from_openai(client, model_name)
 
         if provider == "ollama":
+            kwargs = {**kwargs, "max_retries": 0}
             client = _create_async_openai_compatible_client(
                 api_key_env_var=None,  # No API key required
                 default_base_url="http://localhost:11434/v1",

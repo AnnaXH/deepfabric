@@ -98,11 +98,9 @@ def provider_failure(exception: Exception, provider: str) -> ProviderFailure | N
     """
     if provider not in REVIEWED_PROVIDERS:
         return None
-    if provider == "ollama" and not isinstance(exception, openai.APIStatusError):
-        # This delivery adds raw-SDK policy only. The verified Ollama/Outlines
-        # wrapped-error detection gap is intentionally a separate change.
-        return None
     exception = unwrap_provider_exception(exception)
+    if provider == "ollama" and not isinstance(exception, openai.APIStatusError):
+        return None
     body = getattr(exception, "body", None)
     if not isinstance(body, dict) and provider == "gemini":
         # google-genai stores the response JSON in .details, not .response_json.

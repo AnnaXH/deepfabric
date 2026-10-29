@@ -1,4 +1,4 @@
-"""OpenRouter/Ollama policy; Ollama Outlines normalization is explicitly deferred."""
+"""OpenRouter/Ollama provider policy and wrapped SDK error handling."""
 # ruff: noqa: PLR2004, SIM117
 
 from unittest.mock import AsyncMock, Mock, patch
@@ -160,11 +160,16 @@ def test_inflight_source_is_sufficient_without_reason_or_header():
     assert failure.immediate_reason is None
 
 
-def test_ollama_outlines_wrapper_fix_remains_deferred():
+def test_ollama_outlines_wrapper_preserves_status_and_retry_after():
     wrapped = normalize_provider_exception(api_error(429), "openai")
-    assert provider_failure(wrapped, "ollama") is None
+    failure = provider_failure(wrapped, "ollama")
+    assert failure.status == 429
+    assert failure.retryable_blocker
+    assert failure.retry_after == "0"
     client = make_client("ollama", AsyncMock())
-    assert not client.retry_handler.should_retry(wrapped)
+    assert client.retry_handler.should_retry(wrapped)
+    assert client.retry_handler.detector.is_rate_limit_error(wrapped, "ollama")
+    assert client.retry_handler.detector.extract_quota_info(wrapped, "ollama").retry_after == 0
 
 
 def test_openrouter_inflight_retry_after_uses_existing_delay_cap():

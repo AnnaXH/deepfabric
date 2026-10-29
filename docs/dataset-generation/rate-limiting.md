@@ -9,7 +9,7 @@ The system provides:
 - **Provider-aware defaults** for OpenAI, Anthropic, Gemini, Ollama, OpenRouter
 - **Exponential backoff with jitter** to prevent thundering herd
 - **Retry-after header support** when providers specify wait times
-- **Fail-fast detection** for non-retryable errors (e.g., daily quota exhaustion)
+- **Workflow stops** for confirmed provider access, credit, or spending blockers
 
 ## Provider Defaults
 
@@ -100,17 +100,17 @@ generation:
 
 === "Gemini"
 
-    No retry-after header. Detects daily quota exhaustion and fails fast:
+    Uses bounded retries for `429` errors, including ambiguous quota errors:
 
     ```yaml title="config.yaml"
     rate_limit:
       max_retries: 5
       base_delay: 2.0      # Higher default
-      max_delay: 120.0     # Longer for daily quota
+      max_delay: 120.0     # Maximum backoff delay
     ```
 
-    !!! warning "Daily Quota"
-        When Gemini's RPD (requests per day) limit is hit, the system fails fast rather than retrying since quota resets at midnight Pacific time.
+    !!! info "Quota classification"
+        Gemini quota/spend message fragments are not treated as verified immediate-stop signals. A `429` uses the configured API retry budget, then stops the workflow if it continues. This includes daily quota and rolling spend-window errors when no verified distinguishing signal is available.
 
 === "Ollama"
 
@@ -151,7 +151,85 @@ generator = DataSetGenerator(
 !!! failure "Does NOT Retry"
     - `4xx` errors (except 429)
     - Authentication failures
-    - Daily quota exhaustion (Gemini)
+    - Confirmed OpenAI credit/spend/usage exhaustion
+    - Confirmed Anthropic spend limits or billing failures
+
+### Workflow stops and provider coverage
+
+`generation.rate_limit.max_retries` controls retries of one API request: the initial
+attempt plus that many retries. It is separate from `sample_retries`, which handles
+invalid generated output, and the deprecated generation-level `max_retries`.
+For OpenAI, Anthropic, Gemini, OpenRouter, and Ollama, SDK-internal retries are
+disabled so this API retry budget is not multiplied by a second retry layer.
+
+Confirmed OpenAI credit/spend/usage errors and Anthropic spend/billing errors stop
+generation immediately. Authentication/access errors or a missing configured model
+also stop the run. A potentially temporary or ambiguous `429` retries with backoff;
+if it still fails after the configured budget, the workflow stops rather than
+submitting the remaining sample slots. Request-specific errors and invalid output
+are classified separately and do not automatically stop the entire run.
+
+The error shows the provider's status, code/message, and available retry details.
+DeepFabric cannot determine whether its traffic or another workload caused a shared
+rate limit; check the provider error before changing settings or resuming.
+
+Accepted samples are retained, and unfinished slots remain pending. With checkpointing
+enabled, rerun the same generation command with `--resume` after resolving the issue;
+these pending slots do not require `--retry-failed`. In Python, call
+`load_checkpoint()` before generating again with the same plan. Without checkpointing,
+partial results are exported to `error_dataset.jsonl`, but checkpoint resume is unavailable.
+The CLI exits with status 1, and an enabled run report records `stopped`, not `completed`.
+
+OpenRouter stops immediately on non-temporary 402 credit/budget failures and 403s
+with a recognized budget `limit_source`. A request whose estimated cost exceeds
+its available budget is reported as a cost/budget failure, not a model context-limit
+error. The original provider message and metadata are shown when stopping.
+
+OpenRouter 402s with `limit_source: openrouter_in_flight_budget` are potentially
+temporary: they use bounded API retries and stop only if those retries are exhausted.
+A generic 429 follows the same retry-then-stop policy; DeepFabric does not infer daily
+free-model exhaustion from status or remaining-count headers alone. Moderation,
+content guardrails, and unclassified 403s remain sample failures; repeated blocks
+on related topic nodes do not establish a shared workflow blocker.
+
+Ollama's OpenAI-SDK errors are recognized through the Outlines wrapper. A 429
+uses bounded retries, then stops the workflow; 401/403/404 access failures stop
+immediately. Both sync and async clients disable SDK-internal retries so
+DeepFabric owns the request retry budget. Generic request errors remain sample
+failures. No cloud-specific immediate-exhaustion signature or account monitoring
+calls were added.
+
+### Retry-After handling and long reset windows
+
+The reviewed providers currently differ in how DeepFabric uses `Retry-After`:
+
+| Provider | Retry delay behavior |
+| --- | --- |
+| OpenAI / Anthropic | With `respect_retry_after: true` (default), a numeric header sets the per-request delay, capped at `max_delay`. Otherwise, configured backoff is used. HTTP-date header values are not parsed. |
+| Gemini | Uses configured backoff; the current quota parser does not use `Retry-After` or structured retry-delay details to schedule retries. A captured header can still appear in the final provider error. |
+| OpenRouter | Numeric `Retry-After` on retryable 429s or temporary in-flight-budget 402s sets the delay when enabled, capped at `max_delay`. Otherwise configured backoff is used; HTTP-date values are not parsed. |
+| Ollama | Numeric headers are read from the SDK error preserved by Outlines and set the delay when enabled, capped at `max_delay`. Otherwise configured backoff is used; HTTP-date values are not parsed. |
+
+The live TUI events panel shows the retry attempt and actual wait, such as
+`openai retry (attempt 1), backoff 30.0s`. It does not identify whether the delay
+came from the header or configured backoff, or whether `max_delay` shortened it.
+Run reports record the actual wait but not that source; the header-use decision
+is logged at debug level. Waiting is per request, not a global pause of other workers.
+
+A long provider reset window, such as an exhausted weekly allowance, is a reason
+to stop and resume later rather than keep the invocation waiting. `Retry-After`
+alone does not identify a weekly quota; inspect the provider's error and reset
+details. Confirmed spending blockers already stop immediately even if a header
+is present.
+
+For an otherwise ambiguous error, **automatic stopping based on a long retry
+delay is not yet implemented**. Currently, a numeric header longer than `max_delay`
+is shortened to that cap, so requests may retry before the provider's indicated
+wait has elapsed and stop only after the configured retry budget. `max_delay` is
+a backoff cap, not a workflow waiting deadline. A follow-up should stop with the
+provider's delay/reset information when the required wait is unsuitable for the
+current invocation, preserving the checkpoint for later resume instead of
+shortening that required wait and sending predictably premature retries.
 
 ## Best Practices
 
@@ -197,11 +275,9 @@ generator = DataSetGenerator(
 
 ### Daily Quota Exhausted (Gemini)
 
-The system detects this and fails immediately:
-
-```
-ERROR - Failing fast for gemini: 429 RESOURCE_EXHAUSTED (daily_quota_exhausted=True)
-```
+Gemini returns `429 RESOURCE_EXHAUSTED` for several different limits. DeepFabric
+uses the configured API retry budget, then stops the workflow if the error continues.
+It does not infer daily exhaustion from a generic quota message alone.
 
 !!! info "Options"
     - Wait until midnight Pacific time
