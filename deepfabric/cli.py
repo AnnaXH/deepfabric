@@ -756,7 +756,7 @@ def _report_token_usage(tracker: TokenUsageTracker) -> None:
 @click.option(
     "--checkpoint-path",
     type=click.Path(),
-    help="Override checkpoint directory (default: XDG data dir)",
+    help="Override checkpoint directory (default: output.checkpoint.path, else XDG data dir)",
 )
 @click.option(
     "--resume",
@@ -990,11 +990,17 @@ def generate(  # noqa: PLR0913
             return
 
         # Compute checkpoint directory once for consistent use throughout generation
-        # Use config file for hash, fallback to output path for config-less runs
+        # Precedence: --checkpoint-path, then output.checkpoint.path, then a directory
+        # hashed from the config file (or output path for config-less runs)
         path_source = (
             options.config_file or options.output_save_as or preparation.config.output.save_as
         )
-        checkpoint_dir = options.checkpoint_path or get_checkpoint_dir(path_source)
+        checkpoint_config = preparation.config.output.checkpoint
+        checkpoint_dir = (
+            options.checkpoint_path
+            or (checkpoint_config.path if checkpoint_config else None)
+            or get_checkpoint_dir(path_source)
+        )
 
         # Auto-infer topics-load when resuming from checkpoint
         if options.resume and not options.topics_load:
