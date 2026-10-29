@@ -6,11 +6,16 @@ import random
 import time
 
 from collections.abc import Callable, Coroutine
+from contextlib import suppress
 from functools import wraps
+from http import HTTPStatus
+from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from deepfabric.exceptions import ProviderBlockedError
 from deepfabric.run_report import record_event
 
+from .provider_failure import provider_failure, unwrap_provider_exception
 from .rate_limit_config import BackoffStrategy, RateLimitConfig
 from .rate_limit_detector import RateLimitDetector
 
@@ -39,6 +44,32 @@ class RetryHandler:
         self.provider = provider
         self.detector = RateLimitDetector()
         self.progress_reporter: ProgressReporter | None = None
+        self._stop_lock = Lock()
+        self._blocking_error: ProviderBlockedError | None = None
+
+    def reset_stop(self) -> None:
+        """Begin a new explicit invocation after provider access has been restored."""
+        with self._stop_lock:
+            self._blocking_error = None
+
+    def raise_if_stopped(self) -> None:
+        """Prevent peer workers from starting calls or retries after a shared block."""
+        if self._blocking_error is not None:
+            raise self._blocking_error
+
+    def block_if_needed(
+        self, exception: Exception, *, attempts: int, exhausted: bool = False
+    ) -> None:
+        """Raise a workflow signal on confirmed access failure or exhausted 429 retries."""
+        failure = provider_failure(exception, self.provider)
+        if failure is None or not (
+            failure.immediate_reason or (exhausted and failure.retryable_blocker)
+        ):
+            return
+        with self._stop_lock:
+            if self._blocking_error is None:
+                self._blocking_error = failure.blocked_error(attempts)
+        raise self._blocking_error from exception
 
     def should_retry(self, exception: Exception) -> bool:
         """Determine if an exception should trigger a retry.
@@ -49,13 +80,34 @@ class RetryHandler:
         Returns:
             True if the error is retryable
         """
+        failure = provider_failure(exception, self.provider)
+        if failure is not None:
+            if failure.immediate_reason or (
+                self.provider == "openrouter" and failure.status == HTTPStatus.FORBIDDEN
+            ):
+                # Unclassified/content 403s are sample failures, not retryable
+                # blockers, even if their message contains a transient keyword.
+                return False
+            if failure.retryable_blocker:
+                # Reviewed providers use structured signals, not quota word matches.
+                return True
+            if failure.status in (HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.CONFLICT) or (
+                failure.status is not None
+                and HTTPStatus.INTERNAL_SERVER_ERROR <= failure.status < 600  # noqa: PLR2004
+            ):
+                # Preserve SDK transient-status coverage now that this layer
+                # owns retries, including Anthropic's 529 overload response.
+                return True
+
         # Check if it's a retryable error (rate limit, timeout, server error)
         if not self.detector.is_retryable_error(exception, self.provider):
             return False
 
         # If it's a rate limit error, check if we should fail fast
         if self.detector.is_rate_limit_error(exception, self.provider):
-            quota_info = self.detector.extract_quota_info(exception, self.provider)
+            quota_info = self.detector.extract_quota_info(
+                unwrap_provider_exception(exception), self.provider
+            )
 
             # Don't retry if we should fail fast (e.g., daily quota exhausted)
             if self.detector.should_fail_fast(quota_info):
@@ -86,8 +138,20 @@ class RetryHandler:
         # Extract retry-after from exception if available
         retry_after = None
         if exception and self.config.respect_retry_after:
-            quota_info = self.detector.extract_quota_info(exception, self.provider)
+            quota_info = self.detector.extract_quota_info(
+                unwrap_provider_exception(exception), self.provider
+            )
             retry_after = quota_info.retry_after
+            failure = provider_failure(exception, self.provider)
+            if (
+                retry_after is None
+                and self.provider == "openrouter"
+                and failure is not None
+                and failure.retryable_blocker
+                and failure.retry_after is not None
+            ):
+                with suppress(ValueError):
+                    retry_after = max(0.0, float(failure.retry_after))
 
         # If provider specifies retry-after, use it (with max_delay cap)
         if retry_after is not None:
@@ -207,9 +271,14 @@ def retry_with_backoff(func: Callable[..., T]) -> Callable[..., T]:
         attempt = 0
 
         while attempt <= config.max_retries:
+            retry_handler.raise_if_stopped()
             try:
                 return func(self, *args, **kwargs)
+            except ProviderBlockedError:
+                raise
             except Exception as e:
+                retry_handler.raise_if_stopped()
+                retry_handler.block_if_needed(e, attempts=attempt + 1)
                 # Check if we should retry
                 if not retry_handler.should_retry(e):
                     # Not retryable, raise immediately
@@ -218,6 +287,7 @@ def retry_with_backoff(func: Callable[..., T]) -> Callable[..., T]:
                 # Check if we've exhausted retries
                 if attempt >= config.max_retries:
                     retry_handler.on_giveup_handler({"exception": e, "tries": attempt + 1})
+                    retry_handler.block_if_needed(e, attempts=attempt + 1, exhausted=True)
                     raise
 
                 # Calculate delay and wait
@@ -267,9 +337,14 @@ def retry_with_backoff_async(
         attempt = 0
 
         while attempt <= config.max_retries:
+            retry_handler.raise_if_stopped()
             try:
                 return await func(self, *args, **kwargs)
+            except ProviderBlockedError:
+                raise
             except Exception as e:
+                retry_handler.raise_if_stopped()
+                retry_handler.block_if_needed(e, attempts=attempt + 1)
                 # Check if we should retry
                 if not retry_handler.should_retry(e):
                     # Not retryable, raise immediately
@@ -278,6 +353,7 @@ def retry_with_backoff_async(
                 # Check if we've exhausted retries
                 if attempt >= config.max_retries:
                     retry_handler.on_giveup_handler({"exception": e, "tries": attempt + 1})
+                    retry_handler.block_if_needed(e, attempts=attempt + 1, exhausted=True)
                     raise
 
                 # Calculate delay and wait

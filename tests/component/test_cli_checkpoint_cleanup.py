@@ -1,5 +1,7 @@
 """Checkpoint cleanup after a completed run keeps failed slots retryable."""
 
+import json
+
 from unittest.mock import patch
 
 import pytest
@@ -8,6 +10,7 @@ import yaml
 from click.testing import CliRunner
 
 from deepfabric.cli import cli
+from deepfabric.exceptions import ProviderBlockedError
 
 
 class FakeEngine:
@@ -63,3 +66,33 @@ def test_checkpoint_cleared_only_when_no_samples_failed(tmp_path, failures):
 
     assert result.exit_code == 0, result.output
     assert engine.cleared is (failures == 0)
+
+
+def test_provider_stop_is_nonzero_retains_checkpoint_and_reports_stopped(tmp_path):
+    engine = FakeEngine(0)
+    report_path = tmp_path / "run-report.json"
+    error = ProviderBlockedError(
+        "Generation stopped: openai HTTP 429: Credit balance exhausted. "
+        "Check the provider error, then rerun the same command with --resume."
+    )
+    with (
+        patch("deepfabric.cli.check_for_updates"),
+        patch("deepfabric.cli._validate_api_keys"),
+        patch("deepfabric.cli._initialize_topic_model", return_value=object()),
+        patch("deepfabric.cli.DataSetGenerator", return_value=engine),
+        patch("deepfabric.cli.create_dataset", side_effect=error),
+        patch("deepfabric.cli.save_dataset") as save,
+        patch("deepfabric.cli.trace"),
+        patch("deepfabric.cli._trigger_cloud_upload") as upload,
+    ):
+        result = CliRunner().invoke(
+            cli, ["generate", str(config_file(tmp_path)), "--run-report", str(report_path)]
+        )
+    assert result.exit_code == 1, result.output
+    assert "Credit balance exhausted" in result.output
+    assert "--resume" in result.output
+    assert "Unexpected error" not in result.output
+    assert not engine.cleared
+    save.assert_not_called()
+    upload.assert_not_called()
+    assert json.loads(report_path.read_text())["status"] == "stopped"

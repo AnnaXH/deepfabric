@@ -33,7 +33,7 @@ from .constants import (
     CHECKPOINT_VERSION,
 )
 from .dataset_manager import create_dataset, save_dataset
-from .exceptions import ConfigurationError
+from .exceptions import ConfigurationError, ProviderBlockedError
 from .generator import DataSetGenerator
 from .graph import Graph
 from .llm import VerificationStatus, verify_provider_api_key
@@ -1055,6 +1055,10 @@ def generate(  # noqa: PLR0913
 
     except ConfigurationError as e:
         handle_error(click.get_current_context(), e)
+    except ProviderBlockedError as e:
+        run_status = "stopped"
+        get_tui().error(str(e))
+        sys.exit(1)
     except Exception as e:
         tui = get_tui()  # type: ignore
         tui.error(f"Unexpected error: {str(e)}")  # type: ignore

@@ -46,9 +46,10 @@ from .constants import (
     SEQUENTIAL_PROMPT_WARNING_CHARS,
 )
 from .error_codes import classify_error
-from .exceptions import DataSetGeneratorError
+from .exceptions import DataSetGeneratorError, ProviderBlockedError
 from .llm import LLMClient
 from .llm.client import make_dynamic_model
+from .llm.retry_handler import RetryHandler
 from .metrics import trace
 from .progress import ProgressReporter
 from .prompt_templates import default_template, render_template, template_manifest
@@ -1075,6 +1076,8 @@ class DataSetGenerator:
                             schema_model,
                             max_tokens=config.max_tokens,
                         )
+                    except ProviderBlockedError:
+                        raise
                     except Exception as e:  # noqa: BLE001
                         last_error = e
                         if is_validation_error(e) and attempt < self.config.sample_retries:
@@ -1120,6 +1123,8 @@ class DataSetGenerator:
                     # Builder handles all generation complexity
                     # Pass error feedback from previous attempt if this is a retry
                     conversation = await builder.generate(prompt, error_feedback)
+                except ProviderBlockedError:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     last_error = e
                     is_validation = is_validation_error(e)
@@ -1524,6 +1529,11 @@ class DataSetGenerator:
         )
         # Resume is explicit for each invocation; saving a checkpoint does not select resume.
         self._checkpoint_loaded = False
+        self.stop_requested = False
+        self._active_collection_attempts: dict[str, int] = {}
+        retry_handler = getattr(self.llm_client, "retry_handler", None)
+        if isinstance(retry_handler, RetryHandler):
+            retry_handler.reset_stop()
         self._warn_bulk_token_budget(plan)
 
     @generation_scope
@@ -1548,6 +1558,8 @@ class DataSetGenerator:
                     return samples[0].model_dump(exclude_none=True), None
                 error = failures[0] if failures else {"error": "Generation returned no sample"}
                 break
+            except ProviderBlockedError:
+                raise
             except DataSetGeneratorError as exc:
                 error = {"error": str(exc)}
                 break
@@ -1863,6 +1875,7 @@ class DataSetGenerator:
         while outstanding and attempts < budget and not self.stop_requested:
             requested = len(outstanding)
             attempts += 1
+            self._active_collection_attempts[topic_id] = attempts - 1
             # Reserve an attempt durably before the request, including interrupted calls.
             await self._checkpoint_topic_state(queue, topic_id, attempts=attempts)
             if self.stop_requested:
@@ -1933,6 +1946,8 @@ class DataSetGenerator:
                     else:
                         await queue.put(("outcome", ((topic_id, ordinal), record, None)))
                 last_error = "Bulk collection returned fewer valid records than requested"
+            except ProviderBlockedError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
                 retryable = is_validation_error(exc)
@@ -1953,6 +1968,7 @@ class DataSetGenerator:
             await self._checkpoint_topic_state(
                 queue, topic_id, attempts=attempts, seeds=pending_seeds if seed_scope else None
             )
+            self._active_collection_attempts.pop(topic_id, None)
             await queue.put(
                 (
                     "event",
@@ -2165,6 +2181,8 @@ class DataSetGenerator:
                 }
                 sample = conversation.model_dump(exclude_none=True)
                 success = True
+            except ProviderBlockedError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 error_feedback = str(exc)
                 if self.stop_requested:
@@ -2258,6 +2276,8 @@ class DataSetGenerator:
                     sample_idx=sample_idx + 1,
                 )
                 success = True
+            except ProviderBlockedError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
                 if self.stop_requested:
@@ -2375,6 +2395,8 @@ class DataSetGenerator:
                     }
                     sample = conversation.model_dump(exclude_none=True)
                 success = True
+            except ProviderBlockedError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 error = str(exc)
                 if self.stop_requested:
@@ -2649,9 +2671,11 @@ class DataSetGenerator:
                     elif kind == "topic_state":
                         record_topic_state(payload)
 
-        def flush():
+        def flush(*, force=False):
             nonlocal metadata_dirty
-            if self.config.checkpoint_interval is None or not (pending_completed or metadata_dirty):
+            if self.config.checkpoint_interval is None or not (
+                force or pending_completed or metadata_dirty
+            ):
                 return False
             self._save_checkpoint(
                 pending_samples, pending_failures, pending_completed, sample_slots=pending_slots
@@ -2832,19 +2856,50 @@ class DataSetGenerator:
             else:
                 yield {"event": "generation_complete", **counts()}
         except (Exception, KeyboardInterrupt) as exc:
+            provider_blocked = isinstance(exc, ProviderBlockedError)
+            if provider_blocked:
+                self.stop_requested = True
             await stop_workers(collect_outcomes=True)
+            if provider_blocked:
+                # A provider-blocked/cancelled collection did not consume its
+                # validation budget. Ordinary resume must still be able to call it.
+                self._collection_attempts.update(self._active_collection_attempts)
+                self._active_collection_attempts.clear()
             # Cleanup/export failures must not replace the generation error's original cause.
             recovery_handled = True
+            checkpoint_saved = False
             try:
-                flush()
+                checkpoint_saved = flush(force=provider_blocked)
             except Exception:  # noqa: BLE001
                 logger.exception("Unable to save checkpoint while recovering partial generation")
             interrupted = isinstance(exc, KeyboardInterrupt)
             fallback = INTERRUPTED_DATASET_FILENAME if interrupted else ERROR_DATASET_FILENAME
+            partial_saved = False
             try:
                 self._save_samples_to_file(fallback, include_checkpoint=True)
+                partial_saved = True
             except Exception:  # noqa: BLE001
                 logger.exception("Unable to save partial dataset to %s", fallback)
+            if provider_blocked:
+                if checkpoint_saved:
+                    recovery = (
+                        f"Checkpoint retained at {self._checkpoint_metadata_path}. "
+                        "After resolving the provider error, rerun the same command with --resume "
+                        "(Python: load_checkpoint(), then create_data() with the same plan)."
+                    )
+                else:
+                    recovery = "Checkpoint resume is unavailable for this stop. " + (
+                        f"Partial results were saved to {fallback}; check that file before rerunning."
+                        if partial_saved
+                        else f"Unable to export partial results to {fallback}."
+                    )
+                exc.message = f"{exc.message}\n{recovery}"
+                exc.args = (exc.message,)
+                exc.context.update(
+                    checkpoint_saved=checkpoint_saved,
+                    partial_results_path=fallback if partial_saved else None,
+                )
+                record_event("generation_result", stopped=True, reason=exc.context, **counts())
             self.print_failure_summary()
             yield {
                 "event": "generation_interrupted" if interrupted else "generation_error",
@@ -2852,6 +2907,8 @@ class DataSetGenerator:
                 "error": str(exc),
                 **counts(),
             }
+            if provider_blocked:
+                raise
             if not interrupted:
                 raise DataSetGeneratorError("failed") from exc
         finally:
@@ -2898,6 +2955,8 @@ class DataSetGenerator:
                     self._samples.extend(sample_dicts)
                     return True, len(samples)  # Success - exit retry loop
 
+            except ProviderBlockedError:
+                raise
             except DataSetGeneratorError as e:
                 # Authentication and API errors are now wrapped in DataSetGeneratorError
                 error_str = str(e).lower()

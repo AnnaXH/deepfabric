@@ -361,8 +361,8 @@ class TestRetryHandler:
         # At least some variation (not all the same)
         assert len(set(delays)) > 1
 
-    def test_fail_fast_for_daily_quota(self):
-        """Test that daily quota exhaustion triggers fail-fast."""
+    def test_gemini_quota_text_uses_configured_retry_budget(self):
+        """Unverified Gemini quota text must not bypass the API retry budget."""
         config = RateLimitConfig()
         handler = RetryHandler(config, "gemini")
 
@@ -372,5 +372,5 @@ class TestRetryHandler:
             "generate_requests_per_model_per_day, limit: 0"
         )
 
-        # Should not retry daily quota exhaustion
-        assert handler.should_retry(daily_quota_error) is False
+        # Message fragments alone do not establish a verified immediate-stop signal.
+        assert handler.should_retry(daily_quota_error) is True

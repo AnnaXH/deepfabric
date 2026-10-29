@@ -1194,6 +1194,7 @@ def make_outlines_model(provider: str, model_name: str, **kwargs) -> Any:
     """
     try:
         if provider == "openai":
+            kwargs = {**kwargs, "max_retries": 0}
             client = _create_openai_compatible_client(
                 api_key_env_var="OPENAI_API_KEY",
                 default_base_url=None,  # Use OpenAI's default
@@ -1213,6 +1214,7 @@ def make_outlines_model(provider: str, model_name: str, **kwargs) -> Any:
             return outlines.from_openai(client, model_name)
 
         if provider == "openrouter":
+            kwargs = {**kwargs, "max_retries": 0}
             client = _create_openai_compatible_client(
                 api_key_env_var="OPENROUTER_API_KEY",
                 default_base_url="https://openrouter.ai/api/v1",
@@ -1226,13 +1228,18 @@ def make_outlines_model(provider: str, model_name: str, **kwargs) -> Any:
             if not api_key:
                 _raise_api_key_error("ANTHROPIC_API_KEY")
             # Use native Anthropic structured outputs API
-            client = anthropic.AsyncAnthropic(api_key=api_key, **kwargs)
+            client = anthropic.AsyncAnthropic(api_key=api_key, **{**kwargs, "max_retries": 0})
             return AnthropicModel(client, model_name)
 
         if provider == "gemini":
             api_key = _get_gemini_api_key()
             # Use direct Gemini API instead of Outlines for better structured output reliability
-            client = genai.Client(api_key=api_key)
+            client = genai.Client(
+                api_key=api_key,
+                http_options=genai_types.HttpOptions(
+                    retry_options=genai_types.HttpRetryOptions(attempts=1)
+                ),
+            )
             return GeminiModel(client, model_name)
 
         _raise_unsupported_provider_error(provider)
@@ -1253,6 +1260,7 @@ def make_async_outlines_model(provider: str, model_name: str, **kwargs) -> Any |
 
     try:
         if provider == "openai":
+            kwargs = {**kwargs, "max_retries": 0}
             client = _create_async_openai_compatible_client(
                 api_key_env_var="OPENAI_API_KEY",
                 default_base_url=None,  # Use OpenAI's default
@@ -1272,6 +1280,7 @@ def make_async_outlines_model(provider: str, model_name: str, **kwargs) -> Any |
             return outlines.from_openai(client, model_name)
 
         if provider == "openrouter":
+            kwargs = {**kwargs, "max_retries": 0}
             client = _create_async_openai_compatible_client(
                 api_key_env_var="OPENROUTER_API_KEY",
                 default_base_url="https://openrouter.ai/api/v1",
@@ -1285,13 +1294,18 @@ def make_async_outlines_model(provider: str, model_name: str, **kwargs) -> Any |
             if not api_key:
                 _raise_api_key_error("ANTHROPIC_API_KEY")
             # Use native Anthropic structured outputs API
-            client = anthropic.AsyncAnthropic(api_key=api_key, **kwargs)
+            client = anthropic.AsyncAnthropic(api_key=api_key, **{**kwargs, "max_retries": 0})
             return AnthropicModel(client, model_name)
 
         if provider == "gemini":
             api_key = _get_gemini_api_key()
             # Use direct async Gemini API for better structured output reliability
-            client = genai.Client(api_key=api_key)
+            client = genai.Client(
+                api_key=api_key,
+                http_options=genai_types.HttpOptions(
+                    retry_options=genai_types.HttpRetryOptions(attempts=1)
+                ),
+            )
             return GeminiModel(client, model_name)
 
     except DataSetGeneratorError:

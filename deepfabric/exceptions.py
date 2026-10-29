@@ -37,6 +37,10 @@ class DataSetGeneratorError(DeepFabricError):
     pass
 
 
+class ProviderBlockedError(DataSetGeneratorError):
+    """Provider access blocks generation; unfinished slots must remain pending."""
+
+
 class DatasetError(DeepFabricError):
     """Raised when there is an error in dataset operations."""
 
