@@ -1074,6 +1074,7 @@ class DataSetGenerator:
                             prompt,
                             schema_model,
                             max_tokens=config.max_tokens,
+                            temperature=config.temperature,
                         )
                     except Exception as e:  # noqa: BLE001
                         last_error = e
