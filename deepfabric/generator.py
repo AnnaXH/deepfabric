@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal
 
 from datasets import Dataset as HFDataset
@@ -48,7 +49,9 @@ from .constants import (
 from .error_codes import classify_error
 from .exceptions import DataSetGeneratorError
 from .llm import LLMClient
+from .llm.checkpoint_accounting import CheckpointAccounting, validate_accounting
 from .llm.client import make_dynamic_model
+from .llm.token_usage import TokenUsageTracker, active_token_tracker, track_token_usage
 from .metrics import trace
 from .progress import ProgressReporter
 from .prompt_templates import default_template, render_template, template_manifest
@@ -328,6 +331,11 @@ class DataSetGenerator:
 
         # Checkpoint state
         self._checkpoint_samples_since_save = 0
+        self._checkpoint_lock = RLock()
+        self._accounting = None
+        self._loaded_accounting = None
+        self._legacy_accounting = False
+        self._accounting_persistence_failed = False
         self._completed: set[tuple[str, int]] = set()  # Attempted (UUID, sample ordinal) slots
         self._sample_slots: list[tuple[str, int]] = []
         self._generation_plan: dict | None = None
@@ -438,7 +446,11 @@ class DataSetGenerator:
                 self._checkpoint_samples_path,
             )
 
-    def _save_checkpoint(
+    def _save_checkpoint(self, *args, **kwargs) -> None:
+        with self._checkpoint_lock:
+            self._save_checkpoint_locked(*args, **kwargs)
+
+    def _save_checkpoint_locked(
         self,
         new_samples: list[dict],
         new_failures: list[dict],
@@ -515,6 +527,10 @@ class DataSetGenerator:
         )
 
     def _save_checkpoint_metadata(self) -> None:
+        with self._checkpoint_lock:
+            self._save_checkpoint_metadata_locked()
+
+    def _save_checkpoint_metadata_locked(self) -> None:
         """Save checkpoint metadata file."""
         if self._checkpoint_metadata_path is None:
             return
@@ -549,14 +565,21 @@ class DataSetGenerator:
             ),
         }
 
+        if self._accounting is not None:
+            metadata["token_accounting"] = self._accounting.snapshot()
+        elif self._loaded_accounting is not None:
+            metadata["token_accounting"] = self._loaded_accounting
+
         # Sequential history comes from sample_slots and rows, not a seed map.
         # Retain historical settled seeds when resuming under a different mode.
         if self._topic_seeds or (
             self.config.topic_sample_mode == "bulk" and self.config.shared_scope == "seed"
         ):
             metadata["seeds"] = self._topic_seeds
-        # Publish complete JSON atomically; a partial write must not destroy the
-        # last valid metadata before _save_checkpoint can roll back appended rows.
+        self._write_checkpoint_metadata(metadata)
+
+    def _write_checkpoint_metadata(self, metadata: dict) -> None:
+        """Publish complete metadata while the shared checkpoint lock is held."""
         temporary_path = None
         try:
             with NamedTemporaryFile(
@@ -574,6 +597,26 @@ class DataSetGenerator:
             if temporary_path is not None:
                 with suppress(OSError):
                     temporary_path.unlink(missing_ok=True)
+
+    def _persist_accounting(self, status=None) -> None:
+        """Change only accounting in the last durable sample metadata."""
+        with self._checkpoint_lock:
+            self._accounting.refresh(status)
+            if self._checkpoint_metadata_path is None:
+                return
+            try:
+                with self._checkpoint_metadata_path.open(encoding="utf-8") as stream:
+                    metadata = json.load(stream)
+                metadata["token_accounting"] = self._accounting.snapshot()
+                self._write_checkpoint_metadata(metadata)
+            except Exception:  # noqa: BLE001 - accounting must not mask provider/sample failures
+                self._accounting_persistence_failed = True
+                self._accounting.state["invocations"][self._accounting.invocation_id][
+                    "persistence_failed"
+                ] = True
+                logger.exception(
+                    "Could not persist observed token usage; sample checkpoint retained"
+                )
 
     def _validate_checkpoint_compatibility(self, metadata: dict) -> None:
         """Validate that current config is compatible with checkpoint.
@@ -679,9 +722,14 @@ class DataSetGenerator:
         if not valid:
             raise DataSetGeneratorError(error)
         self._validate_checkpoint_compatibility(metadata)
+        if "token_accounting" in metadata:
+            validate_accounting(metadata["token_accounting"])
         self._samples.clear()
         self.failed_samples.clear()
         self.stop_requested = False
+        self._accounting = None
+        self._loaded_accounting = metadata.get("token_accounting")
+        self._legacy_accounting = self._loaded_accounting is None
         self._generation_plan = metadata["plan"]
         self._checkpoint_loaded = True
         self._completed = {tuple(item) for item in metadata["completed"]}
@@ -745,6 +793,8 @@ class DataSetGenerator:
         self._topic_seeds.clear()
         self._collection_attempts.clear()
         self._checkpoint_loaded = False
+        self._loaded_accounting = None
+        self._legacy_accounting = False
         self._flushed_samples_count = 0
         self._flushed_failures_count = 0
         logger.info("Checkpoint files cleared")
@@ -1423,7 +1473,16 @@ class DataSetGenerator:
             plan = self._prepare_topic_allocations(target, topic_model)
         else:
             plan = {"generation_mode": "step_based", "target": target}
+        tracker = active_token_tracker() or TokenUsageTracker()
         self._prepare_generation_run(plan)
+        self._accounting = CheckpointAccounting(
+            tracker, self._loaded_accounting, legacy=self._legacy_accounting
+        )
+        self._accounting_persistence_failed = False
+        if self.config.checkpoint_interval is not None:
+            tracker.accounting = self._accounting
+            self._save_checkpoint_metadata()
+        tracker.subscribe(self._persist_accounting)
         if num_samples is not None and topic_model is None and target % batch_size:
             logger.info(
                 "Final step will generate %d samples (batch_size=%d) to match num_samples=%d.",
@@ -1448,13 +1507,28 @@ class DataSetGenerator:
             else self._run_step_based_generation_async
         )
         events = runner(**params)
+        completed = False
         try:
-            async for event in events:
+            while True:
+                # A synchronous event consumer may resume each iteration in a new
+                # asyncio task/context. Never hold a ContextVar token across yield.
+                with track_token_usage(tracker):
+                    try:
+                        event = await anext(events)
+                    except StopAsyncIteration:
+                        completed = not self.stop_requested and not self.get_all_failures()
+                        break
                 yield event
         finally:
             try:
-                await events.aclose()
+                with track_token_usage(tracker):
+                    await events.aclose()
             finally:
+                tracker.unsubscribe(self._persist_accounting)
+                self._persist_accounting("completed" if completed else "unfinished")
+                tracker._checkpoint_usage_baseline = tracker.snapshot(
+                    include_accounting=False, include_records=False
+                )
                 if self._large_sequential_prompt_topics:
                     logger.warning(self._sequential_prompt_warning_summary())
 
@@ -1498,6 +1572,9 @@ class DataSetGenerator:
                     "Checkpoint outcome files exist without metadata; use a separate location"
                 )
         if not resuming:
+            self._loaded_accounting = None
+            self._legacy_accounting = False
+            self._accounting = None
             self._samples.clear()
             self.failed_samples.clear()
             self._completed.clear()
